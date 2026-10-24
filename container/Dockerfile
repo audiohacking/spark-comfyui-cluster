@@ -431,8 +431,13 @@ ARG MONARCH_SHA=main
 # probes each worker host over ssh (listener generation and proc id), and
 # 'dgxm doctor' reaches the hosts the same way.
 USER root
+# /opt/monarch-nodes is created here, as root, because only root can give it
+# group 0: /opt carries no setgid bit, so a directory comfy creates lands in
+# group comfy and an arbitrary caller uid could not write it (caught by the
+# arbitrary-uid check, same as the runtime stage's three roots).
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o comfy -g 0 -m 2775 /opt/monarch-nodes
 USER comfy
 # umask 002 instead of a recursive chmod afterwards: the editable install
 # writes into the 6 GB venv, and a chmod -R there would copy the whole venv
@@ -446,7 +451,6 @@ USER comfy
 # dependency checker failing fails the build, same policy as the mods.
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
- && mkdir -p /opt/monarch-nodes && chmod g+s /opt/monarch-nodes \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
  && git -C /opt/monarch-nodes/dgx-monarch checkout ${MONARCH_SHA} \
  && xfw="$(mktemp -d)" \
@@ -468,4 +472,19 @@ RUN umask 002 \
              /home/comfy/.local/state/dgx-monarch \
              /home/comfy/.config/dgx-monarch \
  && ln -s /opt/comfyui-env/bin/python /home/comfy/.local/share/spark-comfyui/python
+# The worker loop filters its environment to an allowlist before Monarch
+# spawns actors (dgx-monarch cli/worker_process_env.py), and TRITON_PTXAS_PATH
+# is not on it, so the actors lose it (measured in-image) and any Triton JIT
+# there (torch.compile, Triton attention kernels) would use Triton's bundled
+# ptxas instead of the CUDA 13 one the driver uses. On torch 2.14.0 the bundled
+# one does JIT a test kernel on sm_121 (A/B measured 2026-10-25), so this is
+# not a fix for a live failure: it keeps the actors on the SAME ptxas as the
+# ComfyUI process, which is the configuration every number here was measured
+# on, rather than letting the worker quietly differ. A .pth line runs in every interpreter of this
+# venv, actors included, and only fills the variable in when it is absent:
+# a fixed image path, never anything inherited, so it widens nothing the
+# filter exists to stop. Cluster stage only; the stand-alone image is
+# untouched.
+RUN printf '%s\n' "import os; os.environ.setdefault('TRITON_PTXAS_PATH', '/usr/local/cuda/bin/ptxas')" \
+      > /opt/comfyui-env/lib/python3.12/site-packages/spark-triton-ptxas.pth
 LABEL org.spark-comfyui.monarch-sha=${MONARCH_SHA}
