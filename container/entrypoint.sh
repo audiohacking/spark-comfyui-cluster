@@ -71,6 +71,19 @@ python /opt/spark/manager-config.py apply \
 #    Warn, never die, like the onnx guard: a registry outage or an offline
 #    box is a missing node, not a reason to refuse to serve.
 log "Registry node list"
+# Cluster mode puts a driver AND a worker container on the same Spark, both
+# bind-mounting the same custom_nodes, and both reach this step at start.
+# Two cm-cli runs cloning the same node into one directory is a corrupt node,
+# so they take turns on a lock that lives in that shared directory (/tmp is
+# per container and would lock nothing). Stand-alone launches never take it
+# and never create the file.
+if [[ "${SPARK_ROLE:-driver}" == "worker" || "${SPARK_MONARCH:-0}" == "1" ]]; then
+  if exec 9>"$INSTALL_DIR/custom_nodes/.spark-node-list.lock" 2>/dev/null; then
+    flock -w 1800 9 || warn "node-list lock still held after 30 min — reconciling anyway"
+  else
+    warn "cannot create the node-list lock in custom_nodes — reconciling unlocked"
+  fi
+fi
 nodes_list=/opt/spark/comfyui-nodes.list
 if [[ ! -f "$nodes_list" ]]; then
   info "no node list mounted — nothing to reconcile"
@@ -292,6 +305,8 @@ else
     fi
   fi
 fi
+# Release the cluster-mode lock (a no-op when it was never taken).
+exec 9>&- 2>/dev/null || true
 
 # 3. Custom-node requirements. Manager clones nodes into the mounted
 #    custom_nodes dir, but their pip deps land in the container's writable
@@ -400,6 +415,26 @@ ensure_onnx_gpu \
   || warn "onnxruntime GPU guard did not complete — DWPose and ControlNet
 preprocessors may fall back to CPU this session (spark-comfyui.sh doctor re-checks)"
 
+# Worker role (cluster image only, started by 'spark-comfyui.sh cluster
+# worker'): a dgx-monarch worker loop instead of the ComfyUI server. It takes
+# steps 1-5 above like a driver, because its actors import the same ComfyUI
+# tree and custom nodes and need the same torch, and skips 6-7: the attention
+# backend is chosen per render by dgx-monarch, and no HTTP server runs here.
+# The address is shape-checked so a typo fails here with its name rather than
+# deep inside Monarch; the loop itself refuses a non-unicast or hostname bind.
+if [[ "${SPARK_ROLE:-driver}" == "worker" ]]; then
+  log "dgx-monarch worker loop"
+  [[ "${SPARK_WORKER_ADDRESS:-}" =~ ^tcp://[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] \
+    || die "SPARK_WORKER_ADDRESS must be tcp://<fabric-ipv4>:<port> (got: '${SPARK_WORKER_ADDRESS:-}')"
+  python -c 'import dgx_monarch' 2>/dev/null \
+    || die "dgx-monarch is not installed in this image — build the cluster image
+(create spark-cluster.toml, then: spark-comfyui.sh update)"
+  info "listening on $SPARK_WORKER_ADDRESS"
+  exec python -m dgx_monarch.cli.worker_loop --address "$SPARK_WORKER_ADDRESS" "$@"
+elif [[ "${SPARK_ROLE:-driver}" != "driver" ]]; then
+  die "SPARK_ROLE must be driver or worker (got: '$SPARK_ROLE')"
+fi
+
 # 6. Attention backend, chosen by SPARK_ATTENTION and then GATED LIVE. The
 #    image build compiled SageAttention blind (no GPU exists at build time),
 #    so this is where golden rule 3 lives for whichever backend is selected.
@@ -479,10 +514,38 @@ elif [[ -n "${SPARK_RESERVE_VRAM:-}" ]]; then
   warn "ignoring SPARK_RESERVE_VRAM='$SPARK_RESERVE_VRAM' (not a number of GB)"
 fi
 
+# Cluster mode runs on the host network (dgx-monarch's actors dial back on
+# dynamic ports), where docker's -p no longer exists. The host's BIND_ADDR and
+# PORT then have to reach main.py itself, as SPARK_LISTEN / SPARK_PORT. Unset,
+# which is every stand-alone launch, keeps the container-scoped defaults.
+# Shape-checked so a stray value cannot inject flags.
+listen=0.0.0.0 port=8188
+if [[ -n "${SPARK_LISTEN:-}" ]]; then
+  [[ "$SPARK_LISTEN" =~ ^[0-9A-Fa-f.:]+$ ]] \
+    || die "SPARK_LISTEN must be an IP address (got: '$SPARK_LISTEN')"
+  listen="$SPARK_LISTEN"
+fi
+if [[ -n "${SPARK_PORT:-}" ]]; then
+  [[ "$SPARK_PORT" =~ ^[0-9]{1,5}$ ]] \
+    || die "SPARK_PORT must be a port number (got: '$SPARK_PORT')"
+  port="$SPARK_PORT"
+fi
+# dgx-monarch's node pack lives in the image, not in the bind-mounted
+# custom_nodes (container/monarch-paths.yaml says why). Only cluster launches
+# load it, so a stand-alone server on the cluster image looks like any other.
+if [[ "${SPARK_MONARCH:-0}" == "1" ]]; then
+  if [[ -f /opt/spark/monarch-paths.yaml ]]; then
+    extra_flags+=(--extra-model-paths-config /opt/spark/monarch-paths.yaml)
+    info "dgx-monarch node pack enabled ($(python -c 'import dgx_monarch; print(dgx_monarch.__version__)' 2>/dev/null || echo 'version unknown'))"
+  else
+    warn "SPARK_MONARCH=1 but this image has no dgx-monarch — rebuild with spark-comfyui.sh update"
+  fi
+fi
+
 log "Launching ComfyUI"
 exec python main.py \
-  --listen 0.0.0.0 \
-  --port 8188 \
+  --listen "$listen" \
+  --port "$port" \
   --enable-manager \
   --preview-method auto \
   --disable-pinned-memory \

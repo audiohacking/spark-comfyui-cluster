@@ -408,3 +408,64 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=4)" || exit 1
 
 ENTRYPOINT ["/opt/spark/entrypoint.sh"]
+
+# --------------------------------------------------------------------------
+# Cluster stage: dgx-monarch on top of the UNCHANGED runtime image. Built only
+# when spark-cluster.toml exists (cmd_build passes --target cluster); every
+# other build passes --target runtime, which is why this stage being last does
+# not change what a stand-alone install ships. Because it is a thin layer on
+# top, moving MONARCH_SHA rebuilds only this stage: no torch download, no
+# SageAttention compile. The monarch commit lives in the image like the
+# ComfyUI one, so :previous, keep-* pins and 'update --rollback' snapshot it
+# together with everything else.
+#
+# The node pack is NOT installed into custom_nodes. That directory is the
+# user's bind-mounted content, and writing a checkout into it would put an
+# image-owned version into data/, where no rollback can reach it. ComfyUI
+# loads extra custom-node roots from --extra-model-paths-config (repeatable),
+# so the entrypoint points one at /opt/monarch-nodes when SPARK_MONARCH=1.
+FROM runtime AS cluster
+ARG MONARCH_REPO=https://github.com/Deen-Media/dgx-monarch.git
+ARG MONARCH_SHA=main
+# openssh-client is for the driver side: before every attach dgx-monarch
+# probes each worker host over ssh (listener generation and proc id), and
+# 'dgxm doctor' reaches the hosts the same way.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+USER comfy
+# umask 002 instead of a recursive chmod afterwards: the editable install
+# writes into the 6 GB venv, and a chmod -R there would copy the whole venv
+# into a new layer. With 002 every new file is group writable at creation, and
+# the venv's g+s directories (runtime stage) give it group 0.
+#
+# The install follows upstream docs/INSTALL.md: build the patched xfuser wheel
+# with the repo's own stdlib tool, then install with ComfyUI's EXACT torch as a
+# constraint so nothing can replace the cu130 build. torch-pins.txt already
+# carries those pins, local tag included, for ensure_torch_cuda. The
+# dependency checker failing fails the build, same policy as the mods.
+RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
+    umask 002 \
+ && mkdir -p /opt/monarch-nodes && chmod g+s /opt/monarch-nodes \
+ && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
+ && git -C /opt/monarch-nodes/dgx-monarch checkout ${MONARCH_SHA} \
+ && xfw="$(mktemp -d)" \
+ && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
+ && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
+      --find-links "$xfw" --constraint /opt/spark/torch-pins.txt \
+ && rm -rf "$xfw" \
+ && python /opt/monarch-nodes/dgx-monarch/tools/check_dependencies.py
+COPY --chown=comfy:0 --chmod=755 container/worker-health.sh /opt/spark/
+COPY --chown=comfy:0 container/monarch-paths.yaml /opt/spark/
+# The cluster.toml 'python' path. dgx-monarch runs its per-host probes with
+# that ONE path on every host, and the driver host runs them locally, i.e.
+# inside this container. On the other hosts the same path is a shim that
+# docker-execs into the worker container ('cluster worker' installs it).
+# The mountpoints are created here owned by comfy:0, so docker does not
+# create them as root at launch.
+RUN umask 002 \
+ && mkdir -p /home/comfy/.local/share/spark-comfyui \
+             /home/comfy/.local/state/dgx-monarch \
+             /home/comfy/.config/dgx-monarch \
+ && ln -s /opt/comfyui-env/bin/python /home/comfy/.local/share/spark-comfyui/python
+LABEL org.spark-comfyui.monarch-sha=${MONARCH_SHA}

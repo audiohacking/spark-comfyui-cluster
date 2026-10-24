@@ -27,7 +27,7 @@
 
 ## Contents
 
-[Quick start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [What it looks like](#what-it-looks-like) · [Mounts](#mounts) · [Patch list](#patch-list-optional) · [Node list](#node-list) · [Recipes](#recipes) · [Troubleshooting](#troubleshooting) · [Security notes](#security-notes)
+[Quick start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [What it looks like](#what-it-looks-like) · [Mounts](#mounts) · [Patch list](#patch-list-optional) · [Node list](#node-list) · [Recipes](#recipes) · [Clustering](#clustering-dgx-monarch) · [Troubleshooting](#troubleshooting) · [Security notes](#security-notes)
 
 ## Quick start
 
@@ -60,6 +60,7 @@ Models go in `data/models/checkpoints` (etc.). No venv, no system Python changes
 | `prune [--yes]` | Reclaims disk: drops leftover image tags and trims the BuildKit cache to its age and size limits. Keeps `:latest`, `:previous` and every `keep-*` pin, and never rebuilds. Shows what goes before it goes. |
 | `reset [--yes]` | Removes the container, all image tags and the cache volume; rebuilds from scratch. `data/` is never touched. Unlike `prune`, this does drop `keep-*` pins. |
 | `recipe list\|show\|check\|install\|capture` | Everything a workflow needs, as data: the workflow, its custom nodes, and every model with a destination, size and sha256. `install` downloads what is missing (resumable, hash-verified) and wires up the rest. `capture` authors one from a workflow that already runs here. |
+| `cluster init\|worker\|push\|status\|dgxm` | Splits renders across several Sparks with [dgx-monarch](https://github.com/Deen-Media/dgx-monarch). Off until `spark-cluster.toml` exists. See [Clustering](#clustering-dgx-monarch). |
 | `shell` | Opens a bash shell inside the running container. For inspecting the venv or a custom node. The image is immutable, so nothing you change there survives a restart. |
 
 ## Configuration
@@ -241,6 +242,39 @@ A path to a `.json` file works too, and `--name` overrides the recipe name, whic
 
 It finds each model under `models/`, records the destination, size and sha256, and fills in the URLs. Those come from recipes you already have, matched on sha256 so a URL is only reused for provably identical bytes, and failing that from ComfyUI-Manager's model list. Anything still blank you fill in yourself; a recipe with a blank URL refuses to install. For a HuggingFace file the hash to match is `lfs.sha256` from `https://huggingface.co/api/models/<repo>?blobs=true`.
 
+## Clustering (dgx-monarch)
+
+[dgx-monarch](https://github.com/Deen-Media/dgx-monarch) splits one render across several Sparks over the ConnectX fabric, or runs one prompt per Spark, from a single ComfyUI window. Upstream measured MiniMax H3 INT8 (1280×720, 241 frames) at 42 min on one Spark and 23 min on two. Upstream installs it bare-metal. Here it runs in the same container image, so the stand-alone rules still apply: one image, rollback, nothing installed on the host.
+
+**It is off until you create `spark-cluster.toml`.** Without that file every command behaves as above. With it, `install`/`update` build a `cluster` image (the normal image plus a thin dgx-monarch layer), and the containers run on the host network so Monarch and NCCL can reach the fabric. `SPARK_CLUSTER=0` forces stand-alone even with the file present.
+
+```bash
+./spark-comfyui.sh cluster init      # seeds spark-cluster.toml + a cluster-only ssh key
+# edit the fabric addresses; copy the file next to spark-comfyui.sh on every Spark
+./spark-comfyui.sh update            # build the cluster image
+./spark-comfyui.sh cluster push      # stream that exact image to every other Spark
+./spark-comfyui.sh cluster worker    # on EVERY Spark, the driver's included (push restarts the remote ones)
+./spark-comfyui.sh run               # ComfyUI, with the dgx-monarch nodes and templates
+./spark-comfyui.sh cluster dgxm doctor
+```
+
+- **Every rank runs identical bytes.** dgx-monarch refuses to attach ranks whose ComfyUI or monarch sources differ, so workers do not build. `cluster push` sends the driver's `:latest` (`docker save | ssh docker load`), keeps the remote's old image as `:previous`, checks the image IDs and restarts the remote worker. `cluster status` compares the image on each host.
+- **Upgrades work like ComfyUI's.** The image pins dgx-monarch to its newest release tag, resolved at every build. `update` moves it, `update --rollback` and `--keep` cover it, and `doctor` says when a newer release exists. `MONARCH_REF=main` follows the branch head instead. After any update or rollback, run `cluster push`.
+- **Workers are containers.** `cluster worker` starts `<CONTAINER_NAME>-worker` with a docker restart policy. That is the healing, so the template sets `auto_heal = false`. It also installs `~/.local/share/spark-comfyui/python`, the `python` path in the config, as a shim into the worker container. dgx-monarch's driver uses that path over ssh to read each worker's identity before every attach.
+- **`dgxm` runs in the container.** `cluster dgxm doctor|status|top`. The bare-metal lifecycle commands (`up`, `down`, `setup`, `update`, `install-service`, …) are refused with the container equivalent.
+- **Same content everywhere.** Every Spark needs the same models (same relative paths under `models/`) and the same custom nodes. Use the same `comfyui-nodes.list`, and `recipe install` on each.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CLUSTER_CONF` | `spark-cluster.toml` | The cluster switch and dgx-monarch's `cluster.toml`. |
+| `MONARCH_REF` | newest `vX.Y.Z` | dgx-monarch tag, branch or commit to build. |
+| `MONARCH_REPO` | upstream | dgx-monarch git URL, for a fork. |
+| `CLUSTER_SSH_DIR` | `~/.ssh/spark-cluster` | The driver container's ssh identity. |
+| `SPARK_WORKER_ADDRESS` | from the config | This Spark's worker bind, when `hostname -I` does not list its fabric IP. |
+| `SPARK_REMOTE_SCRIPT` | this path | Where `spark-comfyui.sh` lives on the other Sparks. |
+
+In cluster mode `PORT` and `BIND_ADDR` are applied by ComfyUI itself, because there is no port map on the host network.
+
 ## Troubleshooting
 
 Start with `./spark-comfyui.sh doctor`; every failure names its fix. Common ones:
@@ -284,6 +318,7 @@ Start with `./spark-comfyui.sh doctor`; every failure names its fix. Common ones
 - Custom nodes run as a non-root user with all capabilities dropped and only your content directories and the GPU visible. A malicious node cannot read your SSH keys or anything else on the host.
 - The image is reproducible from this repo: both base images pinned by digest as well as tag, pinned ComfyUI commit, pinned SageAttention commit, sha256-pinned onnxruntime wheel from PyPI. `update --rollback` returns to the previous image atomically.
 - **`install` and `update` seed `comfyui-nodes.list` with one active entry**, so a fresh install, and an upgrade of an existing one, downloads and runs one third-party node from the Comfy Registry ([comfyui-workflow-models-downloader](https://registry.comfy.org/publishers/slahiri/nodes/comfyui-workflow-models-downloader)). Both print the file when they write it. Comment the line out before your next `run` if you want an install that executes no third-party node code. Everything the containment above says still applies to it.
+- **Cluster mode widens the container**, and only when `spark-cluster.toml` exists. It shares the host's network and process table (`--network host --pid host`) and gets the RDMA devices. The driver container also gets a cluster-only ssh key (never your `~/.ssh`), which the custom nodes in it can read. The other limits stay: non-root, all capabilities dropped, `no-new-privileges`. The Monarch attach API has **no peer authentication**, so the fabric must be dedicated and source-restricted to the cluster hosts on every port. Read upstream's [SECURITY.md](https://github.com/Deen-Media/dgx-monarch/blob/main/SECURITY.md#fabric-trust-boundary) before enabling it. With host networking ComfyUI listens on every interface unless `BIND_ADDR` is set.
 - The UI is published on every interface by default, so anything on your LAN can reach it. `BIND_ADDR=127.0.0.1` restricts it to the box itself; reach it from elsewhere over an SSH tunnel.
 
 > [!WARNING]

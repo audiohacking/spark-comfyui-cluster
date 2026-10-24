@@ -39,3 +39,6 @@ CLAUDE.md
 # orientation rather than product. README.md is the user-facing doc.
 ARCHITECTURE.md
 
+
+# dgx-monarch cluster config (the cluster-mode switch; holds fabric addresses)
+spark-cluster.toml

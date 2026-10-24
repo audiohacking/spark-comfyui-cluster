@@ -1,0 +1,6 @@
+# Extra custom-node root for the cluster image, passed to main.py with
+# --extra-model-paths-config when SPARK_MONARCH=1. The dgx-monarch checkout
+# lives in the image (/opt/monarch-nodes/dgx-monarch), not in the user's
+# bind-mounted custom_nodes, so its version rolls back with the image.
+dgx_monarch:
+  custom_nodes: /opt/monarch-nodes

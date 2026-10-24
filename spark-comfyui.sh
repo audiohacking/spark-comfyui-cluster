@@ -81,6 +81,19 @@
 #                              'capture' authors one from a workflow that
 #                              already runs here. Recipes live in recipes/
 #                              and are tracked, so a recipe is shareable.
+#    cluster init|worker|push|status|dgxm
+#                              Split renders across several Sparks with
+#                              dgx-monarch. Off until spark-cluster.toml
+#                              exists ('cluster init' seeds it); then the
+#                              image gains dgx-monarch (pinned to its latest
+#                              release, moved by 'update', rolled back with
+#                              everything else) and the containers use the
+#                              host network. 'worker [--restart|--disable]'
+#                              runs this Spark's worker container; 'push
+#                              [--no-restart] [HOST...]' streams this image to
+#                              the other Sparks so every rank runs identical
+#                              bytes; 'status' compares them; 'dgxm ARGS'
+#                              runs dgxm doctor/status/top in the container.
 #    backup [--with-output] [FILE]
 #                              Archive the small precious state: workflows,
 #                              settings, inputs, patch and node lists,
@@ -253,6 +266,40 @@ CACHE_MAX_GB="${CACHE_MAX_GB:-40}"
 # data/ directory, mount overrides in spark-mounts.conf next to the script.
 DATA_DIR="${DATA_DIR:-$BASE_DIR/data}"
 MOUNTS_CONF="${MOUNTS_CONF:-$BASE_DIR/spark-mounts.conf}"
+
+# Clustering with dgx-monarch (https://github.com/Deen-Media/dgx-monarch).
+# The FILE is the switch: with no spark-cluster.toml every command behaves
+# exactly as a stand-alone install always has (image target 'runtime', bridge
+# network, port publish). With it, the image gains the 'cluster' stage and the
+# containers run on the host network so Monarch and NCCL can reach the fabric.
+# SPARK_CLUSTER=0 forces stand-alone even with the file present. The file IS
+# dgx-monarch's cluster.toml, mounted read-only where dgxm looks for it;
+# 'cluster init' seeds a container-mode template.
+CLUSTER_CONF="${CLUSTER_CONF:-$BASE_DIR/spark-cluster.toml}"
+# Which dgx-monarch to bake in. Empty means the newest vX.Y.Z release tag,
+# resolved at every build like ComfyUI master is, so 'update' moves it and
+# :previous / keep-* snapshot it. Any ref works (MONARCH_REF=main follows the
+# branch head). Resolved to a commit before the build, never passed as a
+# branch name, so the build cache key is the exact source.
+MONARCH_REPO="${MONARCH_REPO:-https://github.com/Deen-Media/dgx-monarch.git}"
+MONARCH_REF="${MONARCH_REF:-}"
+# The worker container on this Spark. Named after the driver container so an
+# alternate CONTAINER_NAME (a test install) gets an alternate worker too.
+WORKER_NAME="${WORKER_NAME:-${CONTAINER_NAME:-spark-comfyui}-worker}"
+# This script's path on the OTHER Sparks, for 'cluster push' to restart their
+# workers over ssh. Default: the same path as here.
+SPARK_REMOTE_SCRIPT="${SPARK_REMOTE_SCRIPT:-}"
+# cluster.toml's 'python'. dgx-monarch runs its per-host probes with that one
+# path on every host: inside the driver container it is a symlink baked into
+# the image, on the host it is a shim into the worker container that
+# 'cluster worker' installs. '~' is expanded by dgx-monarch, per side.
+readonly MONARCH_PY_REL=".local/share/spark-comfyui/python"
+# The ssh identity the DRIVER container uses for dgx-monarch's per-host
+# probes, mounted read-only as its ~/.ssh. A dedicated directory and not your
+# ~/.ssh on purpose: custom nodes run in that same container, and the
+# confinement promise is that they cannot read your keys. 'cluster init'
+# creates it with a fresh cluster-only key and a copy of your known_hosts.
+CLUSTER_SSH_DIR="${CLUSTER_SSH_DIR:-$HOME/.ssh/spark-cluster}"
 
 # User content inside the ComfyUI tree: what reset holds aside while it
 # wipes and reinstalls everything else. backup/restore cover the same set
@@ -1123,6 +1170,13 @@ cmd_status() {
     csha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.comfy-sha"}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
     built="$(docker image inspect -f '{{.Created}}' "$CONTAINER_IMAGE:latest" | cut -dT -f1)"
     echo "  ComfyUI: ${csha:0:12} (image $CONTAINER_IMAGE:latest, built $built)"
+    local msha
+    msha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+    [[ -z "$msha" ]] || echo "  dgx-monarch: ${msha:0:12}"
+    if cluster_mode; then
+      echo "  cluster: $CLUSTER_CONF, worker $(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' \
+             "$WORKER_NAME" 2>/dev/null || echo "not created") (details: $0 cluster status)"
+    fi
   else
     echo "  ComfyUI: no image built yet (run: $0 install)"
   fi
@@ -1630,6 +1684,40 @@ _image_build_args() {
     --build-arg SAGE_REF="$SAGE_REF"
     --build-arg ORT_WHEEL_URL="$ORT_WHEEL_URL"
   )
+  # The monarch pair only when a sha was resolved. It is consumed by the
+  # 'cluster' stage alone, so passing it to a runtime build would change
+  # nothing but the build log.
+  [[ -z "${2:-}" ]] || IMG_BUILD_ARGS+=(
+    --build-arg MONARCH_REPO="$MONARCH_REPO"
+    --build-arg MONARCH_SHA="$2"
+  )
+}
+
+# Is this install clustered? The file is the switch (see CLUSTER_CONF).
+cluster_mode() {
+  [[ "${SPARK_CLUSTER:-1}" != "0" && -f "$CLUSTER_CONF" ]]
+}
+
+# The dgx-monarch commit to build, or empty if unreachable. MONARCH_REF empty
+# means the newest vX.Y.Z tag: --sort=-v:refname orders tags by version, and
+# the peeled ^{} line of an annotated tag is the commit itself, so it is
+# preferred over the tag object. Same '|| true' contract as
+# _resolve_comfy_master.
+_resolve_monarch_ref() {
+  local ref="$MONARCH_REF" out tag
+  if [[ -z "$ref" ]]; then
+    tag="$(timeout "${1:-30}" git -c versionsort.suffix=- ls-remote --tags --refs \
+             --sort=-v:refname "$MONARCH_REPO" 'v[0-9]*' 2>/dev/null \
+           | awk 'NR==1{sub("refs/tags/","",$2); print $2}' || true)"
+    [[ -n "$tag" ]] || return 0
+    ref="$tag"
+  fi
+  # A full sha needs no lookup (and ls-remote could not find one anyway).
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && { echo "$ref"; return 0; }
+  out="$(timeout "${1:-30}" git ls-remote "$MONARCH_REPO" \
+           "refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref" 2>/dev/null || true)"
+  # Peeled tag first, then a lightweight tag or branch.
+  { grep -m1 '\^{}$' <<<"$out" || head -1 <<<"$out"; } | awk '{print $1}' || true
 }
 
 cmd_build() {
@@ -1641,14 +1729,26 @@ cmd_build() {
   [[ -n "$comfy_sha" ]] \
     || die "could not resolve ComfyUI master from $REPO_URL (offline or
 unreachable) — check the network and re-run"
-  log "Building $CONTAINER_IMAGE:latest (ComfyUI ${comfy_sha:0:12}, SageAttention ${SAGE_REF:0:12})"
+  # The target is chosen here and not in _image_build_args, because the
+  # cold-build check shares those args and passes its own --target.
+  local target=runtime monarch_sha="" monarch_note=""
+  if cluster_mode; then
+    monarch_sha="$(_resolve_monarch_ref)"
+    [[ -n "$monarch_sha" ]] \
+      || die "could not resolve dgx-monarch ${MONARCH_REF:-latest release} from
+$MONARCH_REPO (offline, unreachable, or no such ref) — check and re-run"
+    target=cluster
+    monarch_note=", dgx-monarch ${MONARCH_REF:-latest release} ${monarch_sha:0:12}"
+  fi
+  log "Building $CONTAINER_IMAGE:latest (ComfyUI ${comfy_sha:0:12}, SageAttention ${SAGE_REF:0:12}$monarch_note)"
   echo "  First build downloads ~4 GB and compiles SageAttention; about"
   echo "  5 min on a Spark, longer on a slow link. Rebuilds reuse every"
   echo "  layer that didn't change."
   # "$@" stays AFTER the shared args so a caller's override wins: that is how
   # 'update --torch' hands back empty TORCH_* args to unpin the trio.
-  _image_build_args "$comfy_sha"
+  _image_build_args "$comfy_sha" "$monarch_sha"
   docker build \
+    --target "$target" \
     "${IMG_BUILD_ARGS[@]}" \
     -t "$CONTAINER_IMAGE:latest" \
     "$@" \
@@ -1811,8 +1911,13 @@ _container_run_args() {
   [[ "$(id -u)" != "0" ]] \
     || die "run this as your normal user, not as root — the container runs as
 the calling uid, and root would write root-owned files into your content"
+  # Role: 'driver' (the default, ComfyUI itself) or 'worker' (a dgx-monarch
+  # worker loop from 'cluster worker'). Everything below is shared except the
+  # name, the network block and the role env.
+  local role="${1:-driver}" name="$CONTAINER_NAME"
+  [[ "$role" == worker ]] && name="$WORKER_NAME"
   CRUN_ARGS=(
-    --name "$CONTAINER_NAME"
+    --name "$name"
     --user "$(id -u):$(id -g)"
     --group-add 0
     --gpus all
@@ -1823,7 +1928,6 @@ the calling uid, and root would write root-owned files into your content"
     --shm-size "$SHM_SIZE"
     --cap-drop ALL
     --security-opt no-new-privileges
-    -p "$(_bind_host)${BIND_ADDR:+:}$PORT:8188"
     -v "$CONTAINER_IMAGE-cache:/home/comfy/.cache"
     -e SPARK_BF16
     -e SPARK_BF16_VAE
@@ -1831,6 +1935,11 @@ the calling uid, and root would write root-owned files into your content"
     -e SPARK_RESERVE_VRAM
     -e SPARK_ATTENTION
   )
+  if cluster_mode; then
+    _cluster_run_args "$role"
+  else
+    CRUN_ARGS+=(-p "$(_bind_host)${BIND_ADDR:+:}$PORT:8188")
+  fi
   # The node list is a script-adjacent config file like the patch list, not
   # user content, so it is mounted directly rather than going through the
   # mount contract. Read-only: the entrypoint reads it, nothing writes it.
@@ -1840,6 +1949,77 @@ the calling uid, and root would write root-owned files into your content"
     && CRUN_ARGS+=(-v "$NODES_LIST:/opt/spark/comfyui-nodes.list:ro")
   _content_mount_args
   CRUN_ARGS+=("${CMOUNT_ARGS[@]}")
+}
+
+# The cluster-mode half of _container_run_args, appended to CRUN_ARGS. Only
+# reached when spark-cluster.toml exists; a stand-alone launch never sees it.
+#
+# Host network AND host pid namespace, both load-bearing:
+#  - network: Monarch actors and NCCL bind the fabric IP and dial back on
+#    dynamic ports, and RoCE needs the real interfaces. A port map cannot do
+#    either.
+#  - pid: before EVERY attach the driver checks each worker by reading
+#    /proc/net/tcp, the owner pid of the LISTEN socket and the actor ledger the
+#    loop wrote with its own pid (dgx-monarch cli/listener_generation.py). The
+#    remote half of that runs on the HOST through the shim, so the pid the
+#    loop records must be the host's pid.
+# The confinement that stays: non-root, every capability dropped,
+# no-new-privileges, nothing mounted but content and the state below.
+# /dev/infiniband plus an unlimited memlock is what ibverbs (NCCL over RoCE)
+# needs to register memory without CAP_IPC_LOCK.
+_cluster_run_args() {
+  local role="$1" dir
+  docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' \
+      "$CONTAINER_IMAGE:latest" 2>/dev/null | grep -q . \
+    || die "spark-cluster.toml is present but $CONTAINER_IMAGE:latest has no dgx-monarch —
+build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alone)"
+  CRUN_ARGS+=(--network host --pid host --ulimit memlock=-1:-1)
+  [[ -d /dev/infiniband ]] \
+    && CRUN_ARGS+=(--device /dev/infiniband) \
+    || warn "no /dev/infiniband on this host — NCCL cannot use RoCE (is the ConnectX driver loaded?)"
+  # dgx-monarch state that must outlive the container and be shared by the
+  # driver and worker containers on this host: the actor ledger and generation
+  # marker (state), consent and model-family memos (cache).
+  for dir in .local/state/dgx-monarch .cache/dgx-monarch; do
+    mkdir -p "$HOME/$dir"
+    CRUN_ARGS+=(-v "$HOME/$dir:/home/comfy/$dir")
+  done
+  CRUN_ARGS+=(
+    -v "$CLUSTER_CONF:/home/comfy/.config/dgx-monarch/cluster.toml:ro"
+    -e SPARK_MONARCH=1
+  )
+  if [[ "$role" == worker ]]; then
+    CRUN_ARGS+=(
+      -e SPARK_ROLE=worker
+      -e "SPARK_WORKER_ADDRESS=$SPARK_WORKER_ADDRESS"
+      --health-cmd /opt/spark/worker-health.sh
+      --health-interval 30s --health-timeout 5s --health-retries 3
+      --health-start-period 600s
+    )
+    return 0
+  fi
+  # Driver: ssh for dgx-monarch's per-host probes, from the dedicated
+  # cluster key directory (CLUSTER_SSH_DIR says why it is not ~/.ssh).
+  # Read-only; cluster.toml's ssh_key = "~/.ssh/id_ed25519" resolves here.
+  if [[ -d "$CLUSTER_SSH_DIR" ]]; then
+    CRUN_ARGS+=(-v "$CLUSTER_SSH_DIR:/home/comfy/.ssh:ro")
+  else
+    warn "no $CLUSTER_SSH_DIR — the driver cannot probe the worker hosts and
+every attach will refuse. Create it with: $0 cluster init"
+  fi
+  # Without -p the host's BIND_ADDR/PORT have to reach main.py itself, and the
+  # image's health check (127.0.0.1:8188) has to follow them.
+  local listen="${BIND_ADDR#[}"; listen="${listen%]}"
+  local probe="${listen:-127.0.0.1}"
+  [[ "$probe" == 0.0.0.0 ]] && probe=127.0.0.1
+  [[ "$probe" == *:* ]] && probe="[$probe]"
+  CRUN_ARGS+=(
+    -e "SPARK_LISTEN=${listen:-0.0.0.0}"
+    -e "SPARK_PORT=$PORT"
+    --health-cmd "python -c \"import urllib.request; urllib.request.urlopen('http://$probe:$PORT/system_stats', timeout=4)\""
+    --health-interval 30s --health-timeout 5s --health-retries 3
+    --health-start-period 600s
+  )
 }
 
 # BIND_ADDR in the form docker's -p and a URL both want: a bare IPv6 address
@@ -2007,6 +2187,8 @@ cmd_reset() {
   fi
   stop_container
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # A cluster worker runs the same image; leaving it would pin the old image.
+  docker rm -f "$WORKER_NAME" >/dev/null 2>&1 || true
   local ids
   ids="$(docker images "$CONTAINER_IMAGE" -q | sort -u)"
   if [[ -n "$ids" ]]; then
@@ -2156,6 +2338,12 @@ _image_contract() {
     [[ -x /opt/spark/entrypoint.sh ]]     || { say "no executable /opt/spark/entrypoint.sh (container cannot start)"; fail=1; }
     [[ -r /opt/ComfyUI/main.py ]]         || { say "no /opt/ComfyUI/main.py (mounts land under /opt/ComfyUI)"; fail=1; }
     [[ -x /opt/comfyui-env/bin/python ]]  || { say "no venv python at /opt/comfyui-env/bin/python"; fail=1; }
+    # Cluster images only: what 'cluster' and the entrypoint's worker role
+    # reach for. A stand-alone image has no monarch-paths.yaml and skips this.
+    if [[ -f /opt/spark/monarch-paths.yaml ]]; then
+      [[ -x /opt/comfyui-env/bin/dgxm ]]      || { say "cluster image without dgxm in the venv"; fail=1; }
+      [[ -x /opt/spark/worker-health.sh ]]    || { say "cluster image without /opt/spark/worker-health.sh"; fail=1; }
+    fi
     lib=""
     for c in $1; do
       [[ -r "$c" ]] && { lib="$c"; break; }
@@ -2227,6 +2415,7 @@ cmd_update() {
     echo "  (:previous now holds the image you rolled back FROM, so running"
     echo "  'update --rollback' again toggles forward.)"
     echo "  Restart to pick it up: $0 stop && $0 run"
+    cluster_mode && echo "  Cluster: keep the ranks identical: $0 cluster push"
     return 0
   fi
 
@@ -2302,6 +2491,12 @@ cmd_update() {
   if [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$")" ]]; then
     warn "the running container still uses the old image — restart to pick up
 the update: $0 stop && $0 run"
+  fi
+  # Cluster: every rank must run these same bytes, and the local worker too.
+  if cluster_mode && [[ "$before" != "$after" ]]; then
+    warn "cluster mode: send the new image to the other Sparks and restart the
+workers, or attaches will refuse on mismatched sources:
+  $0 cluster push && $0 cluster worker --restart"
   fi
 }
 
@@ -2436,6 +2631,30 @@ cmd_doctor() {
     csha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.comfy-sha"}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
     created="$(docker image inspect -f '{{.Created}}' "$CONTAINER_IMAGE:latest" | cut -dT -f1)"
     ok "image $CONTAINER_IMAGE:latest (built $created, ComfyUI ${csha:0:12})"
+    # Cluster mode: the image must carry dgx-monarch, and the config must fit
+    # container mode. dgx-monarch's own doctor covers the fabric and the
+    # hosts: '$0 cluster dgxm doctor'.
+    if cluster_mode; then
+      local msha mup cl
+      msha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+      if [[ -z "$msha" ]]; then
+        bad "cluster mode ($CLUSTER_CONF) but the image has no dgx-monarch — run: $0 update"
+      else
+        ok "cluster image, dgx-monarch ${msha:0:12}"
+        mup="$(_resolve_monarch_ref 10)"
+        if [[ -z "$mup" ]]; then
+          info "dgx-monarch ${MONARCH_REF:-latest release} unreachable — staleness unknown"
+        elif [[ "$mup" != "$msha" ]]; then
+          info "dgx-monarch ${MONARCH_REF:-latest release} has moved (now ${mup:0:12}) — $0 update && $0 cluster push"
+        fi
+      fi
+      # The literal ~ is the point: it is compared against the config text.
+      # shellcheck disable=SC2088
+      while IFS= read -r cl; do
+        [[ "$cl" == WARN$'\t'* ]] && bad "spark-cluster.toml: ${cl#WARN$'\t'}"
+      done < <(_cluster_read check "~/$MONARCH_PY_REL" 2>&1 || true)
+      info "fabric and hosts: $0 cluster dgxm doctor"
+    fi
     # Through the helper for its '|| true': this line used to inline the same
     # pipeline without it, so on an offline box 'set -euo pipefail' killed
     # doctor here (exit 128) and the "unreachable" branch below could never
@@ -2706,6 +2925,370 @@ EOS
   fi
 }
 
+# =============================================================================
+#  cluster — dgx-monarch across several Sparks, in containers
+# =============================================================================
+# Upstream dgx-monarch is a bare-metal install: a checkout in custom_nodes,
+# workers as systemd user units, and 'dgxm up/down/setup/update' driving them
+# over ssh. Here the image carries dgx-monarch (the 'cluster' Dockerfile
+# stage), every Spark runs a worker CONTAINER with a docker restart policy, and
+# the image moves between Sparks whole, so every rank runs identical source,
+# which dgx-monarch's attach insists on. dgxm's read-only commands (doctor,
+# status, top) run inside the containers; its lifecycle commands assume the
+# bare-metal layout and are refused with the container equivalent.
+
+_cluster_read() {
+  python3 "$LIB_DIR/cluster_read.py" "$CLUSTER_CONF" "$@"
+}
+
+_need_cluster() {
+  [[ -f "$CLUSTER_CONF" ]] \
+    || die "no cluster config at $CLUSTER_CONF — create one with: $0 cluster init"
+  [[ "${SPARK_CLUSTER:-1}" != "0" ]] \
+    || die "SPARK_CLUSTER=0 forces stand-alone mode; unset it to use the cluster commands"
+}
+
+# ssh destination for one [[hosts]] row, honouring its ssh_user.
+_cluster_dest() { echo "${2:+$2@}$1"; }
+
+# BatchMode: a host without key auth must fail, not sit at a password prompt
+# halfway through a 15 GB image stream.
+_cluster_ssh() {
+  local dest="$1"; shift
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$dest" "$@"
+}
+
+# This Spark's own [[hosts]] row as "name<TAB>address", or nothing.
+_cluster_local_row() {
+  # shellcheck disable=SC2046
+  _cluster_read local $(hostname -I 2>/dev/null) 2>/dev/null || true
+}
+
+# The non-local [[hosts]] rows, "name<TAB>address<TAB>ssh_user" each.
+_cluster_remote_rows() {
+  local local_name rows
+  local_name="$(_cluster_local_row | cut -f1)"
+  rows="$(_cluster_read hosts)" || die "cannot read $CLUSTER_CONF (see above)"
+  awk -F'\t' -v me="$local_name" '$1 != me' <<<"$rows"
+}
+
+cmd_cluster() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    init)   cluster_init "$@" ;;
+    worker) cluster_worker "$@" ;;
+    push)   cluster_push "$@" ;;
+    status) cluster_status "$@" ;;
+    dgxm)   cluster_dgxm "$@" ;;
+    *) die "usage: $0 cluster init | worker [--restart|--disable] | push [--no-restart] [HOST...] | status | dgxm ARGS..." ;;
+  esac
+}
+
+# The driver container's ssh identity: a key that exists only for the
+# cluster, so the custom nodes sharing that container see this key and
+# nothing else of yours. known_hosts starts as a copy of yours, because
+# BatchMode ssh refuses unknown hosts and you have usually reached the
+# workers from here already. Idempotent: an existing directory is kept.
+_cluster_init_ssh() {
+  if [[ ! -f "$CLUSTER_SSH_DIR/id_ed25519" ]]; then
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen not found (install openssh-client)"
+    mkdir -p "$CLUSTER_SSH_DIR"
+    chmod 700 "$CLUSTER_SSH_DIR"
+    ssh-keygen -q -t ed25519 -N "" -C "spark-comfyui-cluster@$(hostname)" \
+      -f "$CLUSTER_SSH_DIR/id_ed25519"
+    [[ -f "$HOME/.ssh/known_hosts" ]] \
+      && cp "$HOME/.ssh/known_hosts" "$CLUSTER_SSH_DIR/known_hosts"
+    log "Created the cluster ssh key in $CLUSTER_SSH_DIR"
+  else
+    info "cluster ssh key already present in $CLUSTER_SSH_DIR"
+  fi
+  cat <<EOF
+  Authorize it on EVERY Spark (this one too: the driver probes its own
+  worker by its fabric address), appending to ~/.ssh/authorized_keys:
+    $(cat "$CLUSTER_SSH_DIR/id_ed25519.pub")
+  Then make sure each fabric address is a known host for the driver:
+    ssh-keyscan -H <fabric-ip> ... >> $CLUSTER_SSH_DIR/known_hosts
+EOF
+}
+
+# Seed a container-mode cluster.toml. Never overwrites: this file is the
+# cluster switch and holds the fabric addresses, so a re-run must not wipe it
+# (a re-run is still useful: it prints the key to authorize again).
+cluster_init() {
+  _cluster_init_ssh
+  if [[ -f "$CLUSTER_CONF" ]]; then
+    info "$CLUSTER_CONF already exists — kept as is (move it aside to re-seed)"
+    return 0
+  fi
+  cat > "$CLUSTER_CONF" <<EOF
+# spark-cluster.toml — dgx-monarch cluster config, container mode.
+# This file's EXISTENCE switches spark-comfyui into cluster mode: the image
+# gains dgx-monarch and the containers run on the host network. Delete it (or
+# SPARK_CLUSTER=0) to go back to stand-alone. It is mounted read-only as
+# dgx-monarch's cluster.toml; full key reference:
+#   https://github.com/Deen-Media/dgx-monarch/blob/main/docs/CLUSTER.md
+#
+# Use the SAME file on every Spark. Replace every 192.0.2.x address (they are
+# documentation-only) with your fabric (ConnectX) addresses.
+#
+# SECURITY: the Monarch attach API has no peer authentication and actors open
+# secondary dynamic ports. The fabric must be a dedicated network with ALL
+# traffic on that interface source-restricted to these hosts; a rule for port
+# 26600 alone is not enough. Read upstream SECURITY.md#fabric-trust-boundary.
+
+[cluster]
+# This (driver) Spark's fabric IP, port 0.
+client_bind = "tcp://192.0.2.11:0"
+# A switch-connected RoCE fabric. For two Sparks on one direct cable,
+# "dgx-spark-pair" is the profile upstream measured.
+fabric_profile = "generic-roce"
+# Required acknowledgement of the trust boundary above.
+transport_security = "trusted_fabric"
+nccl_master_addr = "192.0.2.11"
+nccl_master_port = 29777
+# Container mode: do not change these two.
+#  python    — the driver container has this path baked in; on each host,
+#              '$0 cluster worker' installs a shim there that runs the
+#              probe inside the worker container.
+#  auto_heal — dgx-monarch's heal restarts a bare-metal worker service; the
+#              worker containers heal through their docker restart policy.
+python = "~/$MONARCH_PY_REL"
+auto_heal = false
+# The cluster-only key 'cluster init' created. Inside the driver container
+# ~/.ssh is $CLUSTER_SSH_DIR, mounted read-only.
+ssh_key = "~/.ssh/id_ed25519"
+# rdma_latent_return = false   # off by default upstream; see docs/DESIGN.md
+
+# One entry per Spark, in rank order; the FIRST is the NCCL master and should
+# be the Spark that runs ComfyUI. 'name' is what ssh dials (use the fabric IP
+# so the driver can tell which host is itself); every host declares the same
+# gpus count. Workers on all of them, including the driver's own Spark.
+[[hosts]]
+name = "192.0.2.11"
+address = "tcp://192.0.2.11:26600"
+gpus = 1
+
+[[hosts]]
+name = "192.0.2.12"
+address = "tcp://192.0.2.12:26600"
+gpus = 1
+
+# [[hosts]]
+# name = "192.0.2.13"
+# address = "tcp://192.0.2.13:26600"
+# gpus = 1
+
+# generic-roce sets only NCCL_IB_GID_INDEX and NCCL_DEBUG. Name your NICs
+# (check with: ibdev2netdev, ip -br link):
+# [fabric.generic-roce]
+# NCCL_SOCKET_IFNAME = "enp1s0f0np0"
+# GLOO_SOCKET_IFNAME = "enp1s0f0np0"
+# NCCL_IB_HCA = "rocep1s0f0,roceP2p1s0f0"
+# NCCL_NET_GDR_LEVEL = "SYS"     # GB10 has no GPUDirect RDMA
+# UCX_NET_DEVICES = "enp1s0f0np0"
+
+# ComfyUI settings applied in every actor process (Init-node widgets win):
+# [worker_args]
+# disable_pinned_memory = true
+# reserve_vram_gb = 8.0
+EOF
+  log "Seeded $CLUSTER_CONF"
+  cat <<EOF
+  Next, on the driver Spark:
+    1. edit the addresses (and [fabric.generic-roce] NICs) in that file
+    2. copy it to the same path next to spark-comfyui.sh on every Spark
+    3. $0 update              build the cluster image (dgx-monarch baked in)
+    4. $0 cluster push        send that exact image to every other Spark
+    5. $0 cluster worker      on EVERY Spark (push restarts remote ones)
+    6. $0 run                 ComfyUI with the dgx-monarch nodes
+    7. $0 cluster dgxm doctor
+  Prerequisites: the cluster key above authorized on every Spark (it is
+  what the driver CONTAINER uses); your own passwordless ssh from this host
+  to every 'name' (what 'cluster push' uses); the same models and
+  custom_nodes on every Spark.
+EOF
+}
+
+# The host-side 'python' for dgx-monarch's per-host probes: docker exec into
+# this Spark's worker container, which sees the host's /proc (--pid host) and
+# the shared ledger. Written only if absent or ours, never over someone
+# else's file at that path.
+_cluster_install_shim() {
+  local shim="$HOME/$MONARCH_PY_REL" marker="# spark-comfyui cluster shim"
+  if [[ -e "$shim" ]] && ! grep -qF "$marker" "$shim" 2>/dev/null; then
+    die "$shim exists and is not the spark-comfyui shim — move it aside first"
+  fi
+  mkdir -p "$(dirname "$shim")"
+  cat > "$shim" <<EOF
+#!/usr/bin/env bash
+$marker — written by '$0 cluster worker'.
+# dgx-monarch runs its per-host probes with cluster.toml's 'python'; this
+# runs them inside the worker container, which shares this host's /proc.
+exec docker exec -i "$WORKER_NAME" python "\$@"
+EOF
+  chmod 755 "$shim"
+}
+
+cluster_worker() {
+  need_docker
+  _need_cluster
+  local restart=0
+  case "${1:-}" in
+    --disable)
+      if [[ -n "$(docker ps -aq -f "name=^${WORKER_NAME}$")" ]]; then
+        docker rm -f "$WORKER_NAME" >/dev/null
+        log "Worker disabled and container $WORKER_NAME removed"
+      else
+        info "no worker container to disable"
+      fi
+      return 0 ;;
+    --restart) restart=1; shift ;;
+  esac
+  if [[ -n "$(docker ps -q -f "name=^${WORKER_NAME}$")" ]] && (( ! restart )); then
+    info "worker $WORKER_NAME is already running (--restart recreates it)"
+    return 0
+  fi
+  # This Spark's address comes from its own [[hosts]] row, so one file serves
+  # every Spark. SPARK_WORKER_ADDRESS overrides, for a host whose fabric IP
+  # 'hostname -I' does not list.
+  local row
+  if [[ -z "${SPARK_WORKER_ADDRESS:-}" ]]; then
+    row="$(_cluster_local_row)"
+    [[ -n "$row" ]] || die "no [[hosts]] entry in $CLUSTER_CONF has an address on this
+Spark (local: $(hostname -I 2>/dev/null)) — fix the file, or set SPARK_WORKER_ADDRESS"
+    SPARK_WORKER_ADDRESS="${row#*$'\t'}"
+  fi
+  _cluster_install_shim
+  docker rm -f "$WORKER_NAME" >/dev/null 2>&1 || true
+  _container_run_args worker
+  log "Starting dgx-monarch worker $WORKER_NAME on $SPARK_WORKER_ADDRESS"
+  docker run -d --restart unless-stopped "${CRUN_ARGS[@]}" \
+    "$CONTAINER_IMAGE:latest" "$@" >/dev/null
+  echo "  Health:  docker ps shows 'healthy' once the loop listens"
+  echo "  Logs:    docker logs -f $WORKER_NAME"
+  echo "  Disable: $0 cluster worker --disable"
+}
+
+# Stream this Spark's :latest to the other Sparks, so every rank runs the
+# same bytes. A per-host rebuild would resolve its own ComfyUI master and pip
+# set, and dgx-monarch refuses to attach ranks whose sources differ.
+cluster_push() {
+  need_docker
+  _need_cluster
+  local do_restart=1 hosts=() rows name addr user dest lid rid remote_script
+  [[ "${1:-}" == "--no-restart" ]] && { do_restart=0; shift; }
+  lid="$(docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null)" \
+    || die "no $CONTAINER_IMAGE:latest here — build it first: $0 update"
+  docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' \
+      "$CONTAINER_IMAGE:latest" | grep -q . \
+    || die "$CONTAINER_IMAGE:latest is not a cluster image — run: $0 update"
+  rows="$(_cluster_remote_rows)"
+  if (( $# )); then
+    hosts=("$@")
+  else
+    mapfile -t hosts < <(cut -f1 <<<"$rows")
+  fi
+  (( ${#hosts[@]} )) && [[ -n "${hosts[0]}" ]] || die "no other hosts in $CLUSTER_CONF"
+  remote_script="${SPARK_REMOTE_SCRIPT:-$SELF}"
+  for name in "${hosts[@]}"; do
+    user="$(awk -F'\t' -v n="$name" '$1==n {print $3}' <<<"$rows")"
+    dest="$(_cluster_dest "$name" "$user")"
+    log "Pushing $CONTAINER_IMAGE:latest (${lid:7:12}) to $dest"
+    rid="$(_cluster_ssh "$dest" docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+    if [[ "$rid" == "$lid" ]]; then
+      info "already identical on $dest"
+    else
+      # Same rollback point as 'update' leaves locally.
+      [[ -n "$rid" ]] && _cluster_ssh "$dest" docker tag "$CONTAINER_IMAGE:latest" "$CONTAINER_IMAGE:previous"
+      docker save "$CONTAINER_IMAGE:latest" | _cluster_ssh "$dest" docker load >/dev/null \
+        || die "image transfer to $dest failed"
+      rid="$(_cluster_ssh "$dest" docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+      [[ "$rid" == "$lid" ]] \
+        || die "$dest reports image ${rid:7:12} after the load, expected ${lid:7:12}"
+      info "loaded; $dest now runs the same image (old one kept as :previous)"
+    fi
+    if (( do_restart )); then
+      # The remote script reads the same env names, so an alternate install
+      # (CONTAINER_IMAGE/CONTAINER_NAME overrides) restarts the matching worker.
+      _cluster_ssh "$dest" "$(printf '%q ' env \
+          "CONTAINER_IMAGE=$CONTAINER_IMAGE" "CONTAINER_NAME=$CONTAINER_NAME" \
+          "$remote_script" cluster worker --restart)" \
+        || warn "could not restart the worker on $dest — run there: $remote_script cluster worker --restart"
+    fi
+  done
+  log "Every listed host has image ${lid:7:12}"
+}
+
+cluster_status() {
+  need_docker
+  _need_cluster
+  local lid msha row rows name user dest rid rmsha state line
+  hdr "Cluster ($CLUSTER_CONF)"
+  lid="$(docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+  msha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' \
+           "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
+  echo "  image: ${lid:7:12} dgx-monarch ${msha:0:12}"
+  [[ -n "$msha" ]] || echo "  (not a cluster image — build it: $0 update)"
+  while IFS= read -r line; do
+    [[ "$line" == WARN$'\t'* ]] && warn "${line#WARN$'\t'}"
+  # The literal ~ is the point: it is compared against the config text.
+  # shellcheck disable=SC2088
+  done < <(_cluster_read check "~/$MONARCH_PY_REL" || true)
+  row="$(_cluster_local_row)"
+  state="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' \
+             "$WORKER_NAME" 2>/dev/null || echo "not created")"
+  echo "  this Spark: ${row:-no [[hosts]] entry matches} — worker $state"
+  rows="$(_cluster_remote_rows)"
+  while IFS=$'\t' read -r name _ user; do
+    [[ -n "$name" ]] || continue
+    dest="$(_cluster_dest "$name" "$user")"
+    rid="$(_cluster_ssh "$dest" docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null </dev/null || true)"
+    state="$(_cluster_ssh "$dest" docker inspect -f "'{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}'" \
+               "$WORKER_NAME" 2>/dev/null </dev/null || echo "unknown")"
+    if [[ -z "$rid" ]]; then
+      echo "  $name: unreachable or no image"
+    elif [[ "$rid" == "$lid" ]]; then
+      echo "  $name: same image — worker $state"
+    else
+      rmsha="$(_cluster_ssh "$dest" docker image inspect -f "'{{index .Config.Labels \"org.spark-comfyui.monarch-sha\"}}'" \
+                 "$CONTAINER_IMAGE:latest" 2>/dev/null </dev/null || true)"
+      echo "  $name: DIFFERENT image ${rid:7:12} (dgx-monarch ${rmsha:0:12}) — worker $state; sync: $0 cluster push $name"
+    fi
+  done <<<"$rows"
+}
+
+# dgxm inside a running container: the driver if it runs here, else this
+# Spark's worker. Never a throwaway container, because the entrypoint is what
+# gives the calling uid a passwd entry, and ssh refuses to run without one.
+cluster_dgxm() {
+  need_docker
+  _need_cluster
+  case "${1:-}" in
+    up|restart|setup|init|install-service)
+      die "'dgxm ${1}' manages bare-metal workers; here a worker is a container: $0 cluster worker" ;;
+    down|uninstall)
+      die "'dgxm ${1}' manages bare-metal workers; stop this Spark's worker with: $0 cluster worker --disable" ;;
+    update)
+      die "'dgxm update' rewrites a bare-metal checkout; dgx-monarch updates with the image: $0 update && $0 cluster push" ;;
+    launcher)
+      die "'dgxm launcher' installs a host command for a bare-metal venv; use: $0 cluster dgxm ..." ;;
+    "") die "usage: $0 cluster dgxm doctor|status|top|... (runs dgxm in the container)" ;;
+  esac
+  local ctr=""
+  if [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$")" ]]; then
+    ctr="$CONTAINER_NAME"
+  elif [[ -n "$(docker ps -q -f "name=^${WORKER_NAME}$")" ]]; then
+    ctr="$WORKER_NAME"
+    info "ComfyUI is not running here — using the worker container (it has no ssh keys, so remote checks may fail)"
+  else
+    die "neither $CONTAINER_NAME nor $WORKER_NAME is running — start one: $0 run | $0 cluster worker"
+  fi
+  local tty=(-i)
+  [[ -t 0 && -t 1 ]] && tty+=(-t)
+  docker exec "${tty[@]}" "$ctr" dgxm --config /home/comfy/.config/dgx-monarch/cluster.toml "$@"
+}
+
 # -------------------------------- Libraries ---------------------------------
 # Code that only POPULATES an install, as opposed to operating it. Everything
 # operational (the docker lifecycle, doctor, status/watch, tune,
@@ -2789,6 +3372,7 @@ case "$CMD" in
   prune)    cmd_prune "$@" ;;
   reset)    cmd_reset "$@" ;;
   recipe)   cmd_recipe "$@" ;;
+  cluster)  cmd_cluster "$@" ;;
   shell)    cmd_shell ;;
   # --- hidden backward-compat aliases (old command spellings still work) ---
   verify)   cmd_doctor "$@" ;;
@@ -2796,5 +3380,5 @@ case "$CMD" in
   rollback) cmd_update --rollback ;;
   ""|-h|--help|help) usage ;;
   -v|--version|version) echo "spark-comfyui $VERSION" ;;
-  *) die "Unknown command: $CMD (try: install | run | service | stop | update | doctor | status | tune | recipe | backup | restore | prune | reset | shell)" ;;
+  *) die "Unknown command: $CMD (try: install | run | service | stop | update | doctor | status | tune | recipe | cluster | backup | restore | prune | reset | shell)" ;;
 esac
