@@ -143,6 +143,29 @@ def _latent_shapes(latent_image):
     return [list(samples.shape)]
 
 
+# Frames of each step's latent the cluster preview decodes. Continuity asks
+# for the whole clip (1024), which for a 6 s clip at 768p is 7-9 s of taeh3 on
+# the driver Spark's GPU every step, while rank 0 samples on that same GPU and
+# the other ranks wait for it. 17 frames spread over the clip measured 0.4 s.
+DEFAULT_PREVIEW_FRAMES = 17
+
+
+def _preview_rate(frames, fps, video_shape):
+    """(frames, fps) for the cluster preview: at most SPARK_MONARCH_PREVIEW_FRAMES
+    (0 = Continuity's own count), with the playback rate lowered to match so
+    the loop still lasts as long as the clip."""
+    try:
+        cap = int(os.environ.get("SPARK_MONARCH_PREVIEW_FRAMES", DEFAULT_PREVIEW_FRAMES))
+    except ValueError:
+        cap = DEFAULT_PREVIEW_FRAMES
+    latent_frames = int(video_shape[2]) if len(video_shape) >= 5 else 1
+    if cap <= 0 or frames <= 1 or latent_frames <= cap:
+        return frames, fps
+    # H3 decodes 4 frames per latent frame after the first.
+    decoded = 4 * (latent_frames - 1) + 1
+    return cap, max(1.0, fps * cap / decoded)
+
+
 def _run_with_preview(settings, latent_image, run):
     """Run dgx-monarch's sampler call inside KJNodes' preview wrapper."""
     kj = _kj()
@@ -181,11 +204,12 @@ def _run_with_preview(settings, latent_image, run):
             finally:
                 progress.PREVIEW_SINK = None
 
+    frames, fps = _preview_rate(settings.get("preview_frames", 1),
+                                float(settings.get("preview_fps", 24)), shapes[0])
     wrapper = kj._PreviewOverrideWrapper(
         settings.get("max_resolution", 1024), settings["node_id"],
         settings.get("jpeg_quality", 80), settings.get("suppress_default_preview", True),
-        settings.get("preview_frames", 1), settings.get("preview_fps", 24),
-        None, settings.get("tiny_vae", "none"))
+        frames, fps, None, settings.get("tiny_vae", "none"))
     # The opening frame is drawn from `noise`; a sample of the latent's own
     # shape, as on one card, rather than nothing.
     noise = torch.randn([1, *shapes[0][1:]], device=device)
