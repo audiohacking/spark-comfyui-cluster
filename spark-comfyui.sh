@@ -299,6 +299,12 @@ CACHE_KEEP_DAYS="${CACHE_KEEP_DAYS:-7}"
 CACHE_MAX_GB="${CACHE_MAX_GB:-40}"
 # Container-only layout: all user content under one
 # data/ directory, mount overrides in spark-mounts.conf next to the script.
+# A DATA_DIR that is SET (environment or spark-comfyui.env) is existing
+# content, typically another install's data/ shared on purpose, and is
+# treated as precious: it must already exist, and neither it nor anything in
+# it is ever created. A typo or an unmounted disk then fails loudly instead
+# of growing an empty skeleton the containers would happily run on.
+DATA_DIR_GIVEN="${DATA_DIR:+1}"
 DATA_DIR="${DATA_DIR:-$BASE_DIR/data}"
 MOUNTS_CONF="${MOUNTS_CONF:-$BASE_DIR/spark-mounts.conf}"
 
@@ -1475,7 +1481,7 @@ cmd_restore() {
   for d in user input output; do
     [[ -d "$stage/$d" ]] || continue
     mp="$(_mount_path "$d")"
-    mkdir -p "$mp"
+    _content_mkdir "$mp" "$d"
     cp -a "$stage/$d/." "$mp/"
     echo "  merged $d/"
   done
@@ -1500,7 +1506,7 @@ cmd_restore() {
   log "Restoring custom nodes"
   local nodes_dir
   nodes_dir="$(_mount_path custom_nodes)"
-  mkdir -p "$nodes_dir"
+  _content_mkdir "$nodes_dir" custom_nodes
   local entry name url sha ndir
   if [[ -d "$stage/custom_nodes_plain" ]]; then
     while IFS= read -r entry; do
@@ -1605,7 +1611,32 @@ _expand_tilde() {
   esac
 }
 
+# The precious-DATA_DIR rule (see DATA_DIR_GIVEN). Checked on every resolve,
+# so no launch, worker, doctor or restore gets past a missing data folder.
+_guard_data_dir() {
+  [[ -n "$DATA_DIR_GIVEN" ]] || return 0
+  [[ -d "$DATA_DIR" ]] \
+    || die "DATA_DIR is set to $DATA_DIR but that folder does not exist.
+It is used as existing content and is never created. Mount or restore it,
+or fix DATA_DIR (spark-comfyui.env or the environment)."
+}
+
+# mkdir -p for a content path, except inside a precious DATA_DIR, where a
+# missing entry is reported instead of created: nothing is added to a
+# folder this install does not own.
+_content_mkdir() {
+  local path="$1" entry="$2"
+  [[ -d "$path" ]] && return 0
+  if [[ -n "$DATA_DIR_GIVEN" && "$path/" == "$DATA_DIR/"* ]]; then
+    die "'$entry' is missing in the shared data folder: $path
+DATA_DIR is used as existing content and nothing is created in it. Create it
+yourself if that is intended, or point '$entry' elsewhere in $MOUNTS_CONF."
+  fi
+  mkdir -p "$path" 2>/dev/null
+}
+
 resolve_mounts() {
+  _guard_data_dir
   RESOLVED_ENTRIES=() RESOLVED_PATHS=() EXTRA_MOUNTS=()
   local -A conf=()
   local line key val known entry
@@ -2176,7 +2207,7 @@ _content_mount_args() {
     if [[ "$entry" == *.yaml ]]; then
       [[ -f "$host" ]] && CMOUNT_ARGS+=(-v "$host:/opt/ComfyUI/$entry:ro")
     else
-      mkdir -p "$host" 2>/dev/null \
+      _content_mkdir "$host" "$entry" \
         || die "cannot create the '$entry' mount path: $host
 (permission denied, or a parent that is not writable) — check $MOUNTS_CONF"
       CMOUNT_ARGS+=(-v "$host:/opt/ComfyUI/$entry")
@@ -2273,7 +2304,8 @@ cmd_install() {
   seed_mounts_conf
   seed_patch_list
   seed_nodes_list
-  mkdir -p "$DATA_DIR"
+  # A set DATA_DIR is existing content: checked, never created.
+  if [[ -n "$DATA_DIR_GIVEN" ]]; then _guard_data_dir; else mkdir -p "$DATA_DIR"; fi
   cmd_build
   log "Done!"
   cat <<EOF
