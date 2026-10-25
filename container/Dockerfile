@@ -407,6 +407,11 @@ EXPOSE 8188
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=4)" || exit 1
 
+# The fork's default custom nodes (Continuity), reconciled by the entrypoint
+# after the user's own list. Copied this late, as its own layer, so editing
+# the list rebuilds a few bytes instead of the mods and torch-pin layers.
+COPY --chown=comfy:0 container/default-nodes.list /opt/spark/
+
 ENTRYPOINT ["/opt/spark/entrypoint.sh"]
 
 # --------------------------------------------------------------------------

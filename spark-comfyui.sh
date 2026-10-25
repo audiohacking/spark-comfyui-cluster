@@ -162,14 +162,14 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 BASE_DIR="${BASE_DIR:-$(dirname "$SELF")}"
 
 # Per-folder overrides: spark-comfyui.env next to the script (gitignored).
-# The defaults below name ONE install per box (container and image
-# 'spark-comfyui', cache volume 'spark-comfyui-cache', port 8188), so a second
-# checkout on the same Spark — a fork, a test branch — collides with the first
-# on every one of them unless it is told otherwise. Writing that once here
-# beats remembering a prefix on every command:
+# The default names below are upstream's (container and image
+# 'spark-comfyui', cache volume 'spark-comfyui-cache'), so a checkout next to
+# a stock install collides with it on every one of them unless it is told
+# otherwise. (The port default already differs: 8182, see PORT.) Writing
+# that once here beats remembering a prefix on every command:
 #   CONTAINER_NAME=spark-comfyui-cluster
 #   CONTAINER_IMAGE=spark-comfyui-cluster
-#   PORT=8189
+#   PORT=8182
 # Plain KEY=VALUE lines, parsed rather than sourced (nothing in it runs), and
 # the environment still wins, so a one-off PORT=... on the command line keeps
 # working. 'cluster push' passes the names to the other Sparks explicitly.
@@ -217,7 +217,12 @@ TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.11.0}"
 # Overriding ORT_WHEEL_URL replaces the pin too — re-add a fragment for your
 # own wheel if you want the same guarantee.
 ORT_WHEEL_URL="${ORT_WHEEL_URL:-https://files.pythonhosted.org/packages/fa/96/1be0b9711a614861fbf5c0c85c4da3aa2321f9da0b4734a717eb606f70ab/onnxruntime_gpu-1.29.0-cp312-cp312-manylinux_2_34_aarch64.whl#sha256=545d2966dd11208bbc98e67be4d92e54ecd793acc45c0532cc7bfd36f50692fa}"
-PORT="${PORT:-8188}"
+# 8182, not upstream's 8188: this fork is meant to run on Sparks that also
+# carry a stock spark-comfyui, and its UI must not land on the stock port.
+# Only the host side moves; inside the container ComfyUI still listens on
+# 8188 (the image's EXPOSE and health check), except in cluster mode, where
+# the host network has no port map and main.py binds PORT itself.
+PORT="${PORT:-8182}"
 # Host interface the UI port is published on. Empty is docker's own default:
 # every interface, which is what a headless Spark reached from a laptop needs,
 # and is why the default cannot change without silently breaking every

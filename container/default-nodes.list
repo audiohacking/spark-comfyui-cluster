@@ -1,0 +1,10 @@
+# default-nodes.list — custom nodes every spark-comfyui-cluster install gets,
+# baked into the image and reconciled on every container start together with
+# your own comfyui-nodes.list (same format, same installer). Fork-owned: edit
+# it here, in the repo, and an 'update' ships the change to every Spark.
+#
+# Installed when missing and otherwise left alone, so updating a node from
+# ComfyUI Manager sticks and a restart never downgrades it.
+# SPARK_DEFAULT_NODES=0 skips this list.
+
+https://github.com/roadmaus/ComfyUI-Continuity

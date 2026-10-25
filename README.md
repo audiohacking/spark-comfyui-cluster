@@ -32,9 +32,10 @@ What the fork adds:
 | Image | One `runtime` image | Same, plus an optional `cluster` stage: dgx-monarch at its newest release tag, its xfuser compat wheel, `openssh-client`. Built only when `spark-cluster.toml` exists. It sits on top of `runtime`, so bumping dgx-monarch rebuilds one thin layer in seconds. |
 | Container roles | ComfyUI only | `SPARK_ROLE=driver` (ComfyUI, the default) or `worker` (a dgx-monarch worker loop). `SPARK_MONARCH=1` loads the dgx-monarch node pack from the image, not from your `custom_nodes`. |
 | Networking | Bridge network, `-p PORT:8188` | Unchanged stand-alone. Cluster mode uses `--network host --pid host`, the RDMA devices and an unlimited memlock limit, because Monarch and NCCL need the fabric and dgx-monarch's probes read the host's `/proc`. |
+| Default nodes | — | [Continuity](https://github.com/roadmaus/ComfyUI-Continuity) is installed on every start when missing, and can be updated from ComfyUI Manager. See [Bundled by default: Continuity](#bundled-by-default-continuity). |
 | Commands | — | `cluster init \| worker \| push \| status \| dgxm`, see [Clustering](#clustering-dgx-monarch). |
 | Upgrades | `update` / `--rollback` / `--keep` for ComfyUI | The same commands also move and snapshot dgx-monarch (`org.spark-comfyui.monarch-sha` label). `cluster push` syncs the result to every Spark. |
-| Several installs per box | One per Spark (fixed names, port 8188) | A per-folder `spark-comfyui.env` sets the container, image, cache volume and port, and `run`/`service` refuse a port someone else holds. See [Running two installs on one Spark](#running-two-installs-on-one-spark). |
+| Several installs per box | One per Spark (fixed names, port 8188) | UI on port **8182** by default, so it never lands on a stock install's 8188. A per-folder `spark-comfyui.env` sets the container, image and cache volume names (and the port), and `run`/`service` refuse a port someone else holds. See [Running two installs on one Spark](#running-two-installs-on-one-spark). |
 
 ### Getting it
 
@@ -47,13 +48,13 @@ Clustering is on `main`. The default clone folder, `spark-comfyui-cluster`, alre
 
 ### Next to an existing upstream install
 
-Point a second checkout at its own names before the first `install`. The stock install keeps its container, image, cache volume and port 8188:
+Point a second checkout at its own names before the first `install`. The stock install keeps its container, image, cache volume and port 8188. This fork's UI is already on 8182 by default:
 
 ```bash
 cat > spark-comfyui.env <<'EOF'
 CONTAINER_NAME=spark-comfyui-cluster
 CONTAINER_IMAGE=spark-comfyui-cluster
-PORT=8189
+PORT=8182
 EOF
 ./spark-comfyui.sh status    # "instance:" shows the names in effect
 ```
@@ -86,7 +87,7 @@ git clone https://github.com/audiohacking/spark-comfyui-cluster.git
 cd spark-comfyui-cluster
 ./spark-comfyui.sh install          # one-time image build, about 5 min
 ./spark-comfyui.sh tune --persist   # recommended: swap off, persistence mode
-./spark-comfyui.sh run              # UI at http://<spark-ip>:8188
+./spark-comfyui.sh run              # UI at http://<spark-ip>:8182
 ```
 
 Models go in `data/models/checkpoints` (etc.). No venv, no system Python changes; `sudo` is only used by `tune`.
@@ -117,12 +118,12 @@ Everything is an environment variable, so nothing needs editing to try something
 
 ### Running two installs on one Spark
 
-The defaults name one install per box: container and image `spark-comfyui`, cache volume `spark-comfyui-cache`, port `8188`. A second checkout (a fork, a test branch) needs its own of each. Put them in `spark-comfyui.env` next to the script, which is gitignored and read on every command:
+The default names are upstream's: container and image `spark-comfyui`, cache volume `spark-comfyui-cache`. Only the port differs, since this fork's default is `8182` and upstream's is `8188`. A second checkout next to a stock install needs its own names. Put them in `spark-comfyui.env` next to the script, which is gitignored and read on every command:
 
 ```bash
 CONTAINER_NAME=spark-comfyui-cluster
 CONTAINER_IMAGE=spark-comfyui-cluster   # also names the cache volume: spark-comfyui-cluster-cache
-PORT=8189
+PORT=8182
 ```
 
 The file holds plain `KEY=VALUE` lines. It is parsed, not sourced, and a variable already set in the environment wins. The worker container follows `CONTAINER_NAME` (`spark-comfyui-cluster-worker`). `status` prints the names in effect, and `run`/`service` refuse a port another container or process already holds, naming who has it. `SPARK_ENV_FILE=PATH` points at a different file.
@@ -139,7 +140,7 @@ Set at `run` or `service` time.
 | `SPARK_BF16_VAE` | `1` | Keeps the fast path but takes the VAE off bf16 when set to `0`. |
 | `SPARK_STATIC_VRAM` | `0` | `1` disables DynamicVRAM. |
 | `SHM_SIZE` | `16g` | The container's `/dev/shm` ceiling. The Spark figure for large tensor transfers. |
-| `PORT` | `8188` | Host port. |
+| `PORT` | `8182` | Host port. Upstream uses 8188; this fork moves off it so both can run on one Spark. Inside the container ComfyUI still listens on 8188. |
 | `BIND_ADDR` | unset | Host interface the port is published on. Empty is docker's own behaviour and means every interface, because a Spark is a headless box you reach from a laptop. |
 
 ```bash
@@ -147,7 +148,7 @@ BIND_ADDR=127.0.0.1 ./spark-comfyui.sh service   # this box only
 SPARK_ATTENTION=ck ./spark-comfyui.sh run        # try Comfy Kitchen INT8
 ```
 
-`status` reads the binding back from the running container rather than from your environment, so it always prints a URL that actually works. Reaching a loopback-bound UI from elsewhere is then an SSH tunnel: `ssh -N -L 8188:127.0.0.1:8188 you@spark`.
+`status` reads the binding back from the running container rather than from your environment, so it always prints a URL that actually works. Reaching a loopback-bound UI from elsewhere is then an SSH tunnel: `ssh -N -L 8182:127.0.0.1:8182 you@spark`.
 
 > [!NOTE]
 > On this hardware the attention backend only matters once the workload is compute-bound. At 1024x1024 all three land inside the noise band; at 1536x1536 SDPA costs about 4 percent while `sage` and `ck` tie.
@@ -313,6 +314,17 @@ It is the run-time counterpart to the patch list. Patches are a build input bake
 Nodes already on disk are skipped without a network call, so a normal start costs nothing. A node that fails to install warns and the server still starts, and the next start retries it. Removing a line stops future installs; it does not uninstall a node you already have.
 
 `install` and `update` both seed the file with one active entry, `comfyui-workflow-models-downloader`. Comment it out if you would rather start with nothing.
+
+### Bundled by default: Continuity
+
+Every install of this fork gets [Continuity](https://github.com/roadmaus/ComfyUI-Continuity), the one-node MiniMax H3 / LTX / Krea front end, without editing anything. It comes from `container/default-nodes.list`, which is baked into the image and reconciled on every start right after your own list, with the same installer and the same rules:
+
+- **Missing:** installed at its latest release on the next start.
+- **Already there:** left alone, and found by folder name, pyproject name, git remote or declared repository. That covers a git clone from before, or one in a shared `custom_nodes`.
+- **Updating:** use **Manager → Custom Nodes Manager → Continuity → Update** in the ComfyUI UI. The node lives in your `custom_nodes`, so the update persists across restarts and image updates, and the default list never downgrades it.
+- **Pinning a version:** put a pinned entry for it in your own `comfyui-nodes.list`.
+- **Opting out:** `SPARK_DEFAULT_NODES=0` skips the list. Uninstalling it through Manager only lasts until the next start, because the list then installs it again.
+- **Changing the defaults:** edit `container/default-nodes.list` in the repo and run `update`. The change reaches every Spark with the image.
 
 ## Recipes
 
@@ -494,7 +506,7 @@ cd ~/Documents/ComfyUI/spark-comfyui-cluster
 cat > spark-comfyui.env <<'EOF'
 CONTAINER_NAME=spark-comfyui-cluster
 CONTAINER_IMAGE=spark-comfyui-cluster
-PORT=8189
+PORT=8182
 EOF
 
 # 3. Already have models on this Spark (a stock install's data/)? Share them, don't
@@ -506,7 +518,7 @@ echo "models = ~/Documents/ComfyUI/spark-comfyui/data/models" > spark-mounts.con
 ./spark-comfyui.sh doctor            # every line PASS
 ./spark-comfyui.sh status            # 'instance:' shows the names and port above
 
-# 5. Run, open http://<spark-ip>:8189 (or :8188 without the env file), queue a small workflow
+# 5. Run, open http://<spark-ip>:8182, queue a small workflow
 ./spark-comfyui.sh run
 ```
 
@@ -524,7 +536,7 @@ ip -br addr | grep 192.168.100.        # A's fabric IP is up
 ping -c2 192.168.100.12                 # B answers over the fabric
 ssh 192.168.100.12 docker info >/dev/null && echo ok   # passwordless ssh, docker without sudo on B
 ssh 192.168.100.12 test -x ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
-ss -ltn | grep -E ':(26600|29777|8189)\b' || echo free  # ports free on A; run it on B too
+ss -ltn | grep -E ':(26600|29777|8182)\b' || echo free  # ports free on A; run it on B too
 ```
 
 If your user name differs on B, add `ssh_user = "name"` to B's `[[hosts]]` block in step 2.
@@ -565,7 +577,7 @@ B's worker can stay `starting` for a few minutes on its first start (node requir
 **Render:**
 
 ```bash
-./spark-comfyui.sh run                  # UI on http://<A-ip>:8189
+./spark-comfyui.sh run                  # UI on http://<A-ip>:8182
 ```
 
 1. Open **Workflow → Browse Templates** and load `dgx-monarch-minimax-h3-t2va`. Point its loader at your MiniMax H3 model, and keep the frame count small for the first run.
