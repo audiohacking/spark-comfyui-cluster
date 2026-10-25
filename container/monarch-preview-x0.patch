@@ -1,0 +1,69 @@
+diff -ru a/src/dgx_monarch/actor/sampling.py b/src/dgx_monarch/actor/sampling.py
+--- a/src/dgx_monarch/actor/sampling.py	2026-10-25 16:49:49.104531107 +0100
++++ b/src/dgx_monarch/actor/sampling.py	2026-10-25 16:50:05.745001926 +0100
+@@ -404,6 +404,23 @@
+     return out
+ 
+ 
++def _preview_x0(x0):
++    """spark-comfyui-cluster: the leader's x0 for the driver's live preview.
++
++    The first stream of a nested latent (the picture), detached to CPU fp16:
++    a few MB a step, small next to a step's compute. Never raises; a preview
++    that cannot be taken is a step without one.
++    """
++    try:
++        if x0 is None:
++            return None
++        if getattr(x0, "is_nested", False) or hasattr(x0, "unbind") and type(x0).__name__ == "NestedTensor":
++            x0 = x0.unbind()[0]
++        return x0.detach().to("cpu", torch.float16)
++    except Exception:
++        return None
++
++
+ def make_progress_callback(progress_port, total_steps: int, cancel_event=None):
+     """Stream leader progress and observe driver cancellation on every rank."""
+     if progress_port is None and cancel_event is None:
+@@ -414,7 +431,11 @@
+             raise RenderCancelledError("distributed render cancelled by the ComfyUI driver")
+         if progress_port is not None:
+             try:
+-                progress_port.send({"step": int(step) + 1, "total": int(total or total_steps)})
++                msg = {"step": int(step) + 1, "total": int(total or total_steps)}
++                preview = _preview_x0(x0)
++                if preview is not None:
++                    msg["x0"] = preview
++                progress_port.send(msg)
+             except Exception as exc:
+                 safe_call(log.debug, "progress channel failure: %s", failure_summary(exc))
+ 
+diff -ru a/src/dgx_monarch/progress.py b/src/dgx_monarch/progress.py
+--- a/src/dgx_monarch/progress.py	2026-10-25 16:49:49.060531111 +0100
++++ b/src/dgx_monarch/progress.py	2026-10-25 16:50:05.745105366 +0100
+@@ -12,6 +12,11 @@
+ 
+ log = get_logger(__name__)
+ 
++# spark-comfyui-cluster: where a leader's per-step x0 goes on the driver, for a
++# live preview. None drops it. Called on the pump thread as
++# sink(step, total, x0) with step 1-based; it must not raise into the bar.
++PREVIEW_SINK = None
++
+ 
+ def _thread_started(thread: threading.Thread) -> bool:
+     """Whether this thread got far enough through start() to join.
+@@ -100,6 +105,13 @@
+                 self._last_activity = time.monotonic()
+                 if not isinstance(msg, dict) or msg.get("done"):
+                     return
++                x0 = msg.pop("x0", None)
++                sink = PREVIEW_SINK
++                if x0 is not None and sink is not None:
++                    try:
++                        sink(msg.get("step", 0), msg.get("total", self._total), x0)
++                    except Exception as exc:
++                        log.debug("preview sink failed: %r", exc)
+                 try:  # telemetry tap (dgxm top): never allowed to break the bar
+                     from .telemetry import render_progress
+ 

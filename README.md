@@ -650,6 +650,13 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 - **Always local:** the face, refine (two-pass upscale), re-detail and seam-restore passes sample on the driver Spark after the cluster has done the main pass. They use Continuity's own LoRA stack and patches.
 - **The log says which:** `comfyui_8182.log` names every local decision and its reason, for example `Continuity: the face pass samples on this Spark`.
 
+**Live preview.** A cluster render shows Continuity's usual animated preview in the Creator node.
+- **How it works:** the worker that collects results streams each step's latent back to the driver, a small dgx-monarch patch in the image (`container/monarch-preview-x0.patch`). The driver runs KJNodes' own preview override on it, configured exactly as Continuity configures it on one GPU.
+- **The tiny VAE matters:** with madebyollin's [`taeh3.safetensors`](https://github.com/madebyollin/taehv/blob/main/safetensors/taeh3.safetensors) in `models/vae_approx`, the frames are real taeh3 decodes. Without it, they're KJNodes' coarse latent2rgb fallback, the same as on one GPU.
+- **Cost:** the decode runs on the driver Spark while the workers sample, about 16 s per step for a 6 s clip at 768p.
+
+**Faster local passes.** While the cluster samples a render that has a face, refine or re-detail pass, the driver asks the kernel to read that pass's checkpoint and the SAM3 detector ahead. The local pass then starts from memory instead of a cold 20 GB read. This only uses the page cache, which the kernel can drop again under pressure.
+
 A local pass loads a second copy of the transformer on the driver Spark, about 21 GB for H3 int8, next to the cluster's own copy on that Spark's worker. Leave that much memory free there: an idle stock ComfyUI on the same Spark that's holding a model can use it up. LoRAs on the cluster are merged by dgx-monarch's LoRA loader rather than Continuity's own H3 stack.
 
 ### Day to day
