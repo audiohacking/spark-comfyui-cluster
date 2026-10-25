@@ -29,7 +29,6 @@ import logging
 import os
 import sys
 import threading
-import time
 import types
 
 log = logging.getLogger("spark.continuity_monarch")
@@ -217,57 +216,10 @@ def _run_with_preview(settings, latent_image, run):
                    True, 0, shapes)
 
 
-def _mem_available_gib():
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / 1048576
-    except OSError:
-        pass
-    return 0.0
-
-
-def _is_capacity_refusal(exc):
-    """dgx-monarch's pre-dispatch capacity refusals (class C): raised before
-    anything reaches the workers, so a retry after freeing memory is safe."""
-    return (type(exc).__name__ in ("StockLoadCapacityError", "DriverFootprintCapacityError")
-            or str(exc).startswith("[dgxm:C "))
-
-
-def _free_driver_models():
-    """Unload this ComfyUI's own models (text encoder, VAEs, detector) and
-    return the GiB that gave back to the host. They are idle while the cluster
-    samples and reload from the page cache when a later node needs them; on
-    unified memory this is memory rank 0 on this Spark can use."""
-    import gc
-
-    import comfy.model_management as mm
-
-    before = _mem_available_gib()
-    # unload_all_models walks comfy's loaded-model list by index, and another
-    # thread can change that list mid-walk during a prompt (an IndexError);
-    # a few tries, and never an exception out of here.
-    for _ in range(3):
-        try:
-            mm.unload_all_models()
-            break
-        except Exception as exc:
-            log.debug("unload_all_models raised %r; trying again", exc)
-            time.sleep(0.5)
-    try:
-        gc.collect()
-        mm.soft_empty_cache(True)
-    except Exception as exc:
-        log.debug("cache release raised %r", exc)
-    return _mem_available_gib() - before
-
-
 def wrap_sampler():
     """Wrap DGXMonarchKSampler.sample for a model carrying SparkMonarchPreview
-    settings: the page-cache prefetch, the live preview, and one retry after
-    freeing this ComfyUI's idle models when dgx-monarch refuses the render for
-    capacity. Renders without those settings run exactly as before."""
+    settings: the page-cache prefetch and the live preview. Renders without
+    those settings run exactly as before."""
     import nodes
 
     cls = nodes.NODE_CLASS_MAPPINGS.get("DGXMonarchKSampler")
@@ -306,22 +258,7 @@ def wrap_sampler():
                 log.exception("Continuity: the cluster preview could not start; rendering without it")
                 return orig(self, model, *args, **kwargs)
 
-        try:
-            return attempt()
-        except Exception as exc:
-            if not _is_capacity_refusal(exc):
-                raise
-            try:
-                freed = _free_driver_models()
-            except Exception:
-                log.exception("Continuity: freeing this ComfyUI's models failed")
-                freed = 0.0
-            if freed < 1.0:
-                raise exc
-            log.warning("Continuity: dgx-monarch refused the render for capacity; freed %.1f GiB "
-                        "of this ComfyUI's idle models (they reload when needed) and retrying once",
-                        freed)
-            return attempt()
+        return attempt()
 
     sample.__wrapped__ = orig
     setattr(cls, cls.FUNCTION, sample)

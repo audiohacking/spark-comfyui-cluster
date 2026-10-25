@@ -397,9 +397,8 @@ def _wrap(cls, mods):
                     name = None
                 if isinstance(name, str) and name:
                     prefetch.append(name)
-        # Always attached, empty or not: the wrapper it hands settings to also
-        # frees this ComfyUI's idle models and retries once when dgx-monarch
-        # refuses the render for capacity.
+        if not preview and not prefetch:
+            return model
         spec = json.dumps({"preview": preview, "prefetch": prefetch}, sort_keys=True)
         return graph.node(monarch_preview.NODE_ID, model=model, spec=spec).out(0)
 
