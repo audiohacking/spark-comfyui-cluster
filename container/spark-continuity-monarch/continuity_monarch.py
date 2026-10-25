@@ -27,15 +27,17 @@ are untouched: Continuity's pre-stage pins its own weights to the local card
 (`families/h3/still.py`), which reads the weights outside the family hook
 wrapped here.
 
-**What the cluster cannot carry is refused by name**, before anything is
-queued, in Continuity's own terms and for its own reason: a render that came
-out different from the one asked for is worse than one that did not start.
-The mesh holds one transformer with one LoRA stack merged in, and the driver
-holds no MODEL at all, so everything that patches or samples a local model is
-out: the turbo lead-in, the refine, face and re-detail passes, blended sound
-seams, ControlNet guides, the model-patch accelerators, device pins, a
-two-checkpoint route, and a sigma shift off the checkpoint's own (dgx-monarch
-carries one SD3-style shift; H3's is a video/audio pair).
+**Nothing is refused; the cluster takes what it can carry.** Each
+generation's main pass samples on the mesh when it can, and on this Spark,
+exactly as Continuity does on one card, when it cannot: a turbo lead-in, a
+sigma shift off the checkpoint's (dgx-monarch carries one SD3-style shift,
+H3's is a video/audio pair), a sound seam, a ControlNet guide, a model-patch
+accelerator, a LoRA with its audio dial down, or a second checkpoint or LoRA
+stack in the same strip (the mesh holds one). The face, refine, re-detail and
+seam-restore passes always sample here, with Continuity's own LoRA stack and
+patches, after the cluster has done the heavy pass. Every local decision is
+logged with its reason. LoRAs on the cluster are merged by dgx-monarch's
+loader rather than Continuity's own H3 stack.
 """
 
 from __future__ import annotations
@@ -63,9 +65,9 @@ _PAYLOAD = ".creator.families.h3.payload"
 _LORA = ".creator.lora"
 
 # The family methods wrapped below; all must exist or nothing is touched.
-_HOOKS = ("weights_from_blob", "preflight", "emit_loaders", "_segment_inputs",
-          "emit_control", "emit_sampler", "emit_refine", "emit_face",
-          "emit_seam_restore")
+_HOOKS = ("weights_from_blob", "preflight", "emit_loaders", "emit_segment",
+          "_segment_inputs", "emit_control", "emit_sampler", "emit_refine",
+          "emit_face", "emit_seam_restore")
 
 _installed = False
 # What install() last concluded, for the status route and the logs.
@@ -105,18 +107,22 @@ def _require(node_id):
     return node
 
 
-def _off_hint():
-    return ("or render on this card alone (SPARK_CONTINUITY_MONARCH=0 for the "
-            "deployment)")
+# ---- what goes where ---------------------------------------------------------
+#
+# Nothing is refused. The cluster takes each generation's main pass when it
+# can carry it; anything it cannot is sampled on this Spark exactly as
+# Continuity does on one card, with its own LoRA stack and patches, and the
+# log says which and why. The local loaders are always in the graph for that,
+# and cost nothing unless a local pass uses them: ComfyUI runs an expanded
+# graph from its outputs, so a loader nothing reads never executes.
 
 
-# ---- what the cluster cannot carry -----------------------------------------
-
-
-def refuse_accel(acceleration):
-    """The accelerators are patches on a local MODEL, which a cluster render
-    does not have. The attention backend is the exception: dgx-monarch picks a
-    kernel on its initializer, and 'sage' maps onto that."""
+def accel_blocker(acceleration):
+    """Why the accelerator row keeps the main pass local, or None. They are
+    patches on a local MODEL; the attention backend is the exception, which
+    dgx-monarch picks on its initializer ('sage' maps onto that)."""
+    if acceleration is None:
+        return None
     for on, what in (
             (acceleration.block_cache != "off", f"the '{acceleration.block_cache}' step cache"),
             (acceleration.spectrum, "Spectrum"),
@@ -124,122 +130,47 @@ def refuse_accel(acceleration):
             (acceleration.fp16_accumulation, "fp16 accumulation"),
             (acceleration.attention == "kitchen", "the kitchen attention kernel")):
         if on:
-            raise ValueError(
-                f"{what} patches the model on this side of the wire, and a "
-                f"cluster render's model lives in the dgx-monarch workers. "
-                f"Switch it off under Settings -> Rendering, {_off_hint()}."
-            )
+            return f"{what} patches a local model"
+    if acceleration.attention == "sage" and attention_option("sage") is None:
+        return "this dgx-monarch offers no sage attention"
+    return None
 
 
-def refuse_weights(weights, routes):
-    if getattr(weights, "devices", None):
-        pinned = ", ".join(sorted(weights.devices))
-        raise ValueError(
-            f"{pinned} is pinned to a device, and a cluster render's transformer "
-            f"is placed by dgx-monarch across the Sparks. Clear the device pins "
-            f"in the node's 'weights' control, {_off_hint()}."
-        )
-    if len(routes) > 1:
-        named = " and ".join(sorted(name.upper() for name in routes))
-        raise ValueError(
-            f"This render routes to both {named}, and the cluster holds one "
-            f"transformer: sampling it would reload the weights on every Spark "
-            f"between shots. Set the route to one checkpoint in the node's "
-            f"'weights' control (Ref2VA takes everything FL2VA does), "
-            f"{_off_hint()}."
-        )
-
-
-def refuse_run(compiled, splits, sampling, label=None):
-    where = f"{label}: " if label else ""
+def run_blocker(compiled, splits, sampling, anchors_anywhere):
+    """Why one generation's main pass stays local, or None."""
     if splits:
-        raise ValueError(
-            f"{where}the turbo lead-in samples the opening steps with the "
-            f"distillation held off the same checkpoint, which is the weights "
-            f"twice, and the cluster holds one model. Set the turbo lead-in to "
-            f"0 steps under Settings -> Rendering, {_off_hint()}."
-        )
+        return "the turbo lead-in samples the opening steps on a second copy of the weights"
     if sampling.shifted():
-        raise ValueError(
-            f"{where}the sigma shift is off the checkpoint's own "
-            f"(video {sampling.shift_video}, audio {sampling.shift_audio}). "
-            f"dgx-monarch carries a single SD3-style shift and H3's is a "
-            f"video/audio pair, so the workers would sample a different "
-            f"schedule. Put the shifts back to the checkpoint's defaults, "
-            f"{_off_hint()}."
-        )
+        return (f"the sigma shift (video {sampling.shift_video}, audio "
+                f"{sampling.shift_audio}) is off the checkpoint's, and dgx-monarch "
+                f"carries one SD3-style shift, not H3's pair")
     if compiled.continues_audio or compiled.ends_on_audio:
-        raise ValueError(
-            f"{where}this seam carries the soundtrack across the cut, anchored "
-            f"by a wrapper around the forward pass on this side of the wire, "
-            f"which never reaches the cluster's workers. Switch the sound seam "
-            f"off for this shot, {_off_hint()}."
-        )
-    for attribute, setting in (("refine", "the two-pass upscale"),
-                               ("face", "the face pass"),
-                               ("redetail", "the re-detail pass")):
-        if getattr(compiled, attribute, None):
-            raise ValueError(
-                f"{where}{setting} samples in-process against a model on this "
-                f"Spark, and a cluster render has none here. Switch it off for "
-                f"this piece, {_off_hint()}."
-            )
-
-
-def refuse_seam(compiled, anchors_anywhere, label=None):
-    if anchors_anywhere:
-        return
-    if compiled.continues or compiled.ends_on:
-        where = f"{label}: " if label else ""
-        raise ValueError(
-            f"{where}this seam pins the previous shot's last frames by a "
-            f"wrapper around the forward pass, which does not reach the "
-            f"cluster's workers on this ComfyUI. Update ComfyUI (2026-08-14 or "
-            f"later anchors them itself), {_off_hint()}."
-        )
-
-
-def refuse_guide():
-    raise ValueError(
-        "A ControlNet guide is applied by core's forward on a local model, and "
-        "the cluster's workers run dgx-monarch's own H3 forward. Switch the "
-        f"guide pill off, {_off_hint()}."
-    )
-
-
-def refuse_pass(what):
-    raise ValueError(
-        f"{what} samples in-process against a model on this Spark, and a "
-        f"cluster render has none here. Switch it off, {_off_hint()}."
-    )
+        return "the sound seam is anchored by a wrapper on the local forward pass"
+    if not anchors_anywhere and (compiled.continues or compiled.ends_on):
+        return "this ComfyUI anchors picture seams with a wrapper on the local forward pass"
+    if getattr(compiled, "guide", None):
+        return "a ControlNet guide is read by core's forward, not dgx-monarch's"
+    return None
 
 
 # ---- the mesh --------------------------------------------------------------
 
 
 def attention_option(attention):
-    """dgx-monarch's kernel for our setting, read off the installed class."""
+    """dgx-monarch's kernel for our setting, read off the installed class.
+    None for 'default' (the Init node's own pick), or when there is no sage."""
     if attention != "sage":
         return None
     declared = (_require(INIT_NODE).INPUT_TYPES().get("optional") or {}).get("attention")
     options = [str(option) for option in (declared[0] if declared else [])]
-    match = next((option for option in options if "SAGE" in option.upper()), None)
-    if match is None:
-        raise ValueError(
-            f"This dgx-monarch offers no sage attention ({options}). Set the "
-            f"attention back to 'default' under Settings -> Rendering."
-        )
-    return match
+    return next((option for option in options if "SAGE" in option.upper()), None)
 
 
 class Models:
-    """The cluster's model for this render: built once, handed to every shot.
-
-    One mesh, one transformer, one LoRA stack, the same contract Continuity's
-    `raylight.Actors` keeps for the same reason: a strip that asks for a
-    different combination partway through would reload every Spark between
-    shots, which is refused rather than done quietly.
-    """
+    """The cluster's model for this render: one mesh, one transformer, one
+    LoRA stack, built on the first generation that samples there. A later
+    generation asking for another checkpoint or stack samples locally rather
+    than reloading every Spark mid-strip."""
 
     def __init__(self, graph, weights):
         self._graph = graph
@@ -247,27 +178,27 @@ class Models:
         self._link = None
         self._key = None
 
+    @staticmethod
+    def key(checkpoint, loras):
+        return (checkpoint, tuple((name, round(float(strength), 6))
+                                  for name, strength in loras))
+
+    def claims(self, key):
+        """Whether `key` may sample on the cluster; the first ask claims it."""
+        if self._key is None:
+            self._key = key
+        return key == self._key
+
     def of(self, checkpoint, loras, acceleration):
-        key = (checkpoint, tuple((name, round(float(strength), 6))
-                                 for name, strength in loras))
-        if self._link is not None:
-            if key != self._key:
-                raise ValueError(
-                    "Every shot in a cluster render shares one set of weights, "
-                    "and this strip asks for a different checkpoint or LoRA "
-                    "stack partway through. Give the shots the same LoRAs and "
-                    "checkpoint, or render them in separate queues."
-                )
-            return self._link
-        self._key = key
-        self._link = self._build(checkpoint, loras, acceleration)
+        if self._link is None:
+            self._link = self._build(checkpoint, loras, acceleration)
         return self._link
 
     def _build(self, checkpoint, loras, acceleration):
         for node_id in REQUIRED_NODES:
             _require(node_id)
         init = {"topology": "auto", "mode": "auto"}
-        chosen = attention_option(acceleration.attention)
+        chosen = attention_option(getattr(acceleration, "attention", "default"))
         if chosen is not None:
             init["attention"] = chosen
         mesh = self._graph.node(INIT_NODE, **init).out(0)
@@ -291,6 +222,51 @@ def _wrap(cls, mods):
     payload_mod = mods["payload"]
     lora_mod = mods["lora"]
     orig = {name: getattr(cls, name) for name in _HOOKS}
+    anchors_anywhere = getattr(payload_mod, "CORE_ANCHORS_ANYWHERE", False)
+
+    def local(weights):
+        """The same weights, as Continuity's one-card path reads them."""
+        mine = copy.copy(weights)
+        mine.backend = rl.DEFAULT
+        return mine
+
+    def label_of(payload):
+        progress = payload.get("progress") or {}
+        return f"segment {progress['index']}" if progress.get("index") else "this generation"
+
+    def cluster_loras(self, payload, compiled):
+        """The stack as the workers take it, or (None, why) when they cannot:
+        an audio dial slices adaLN rows, which only Continuity's stack does."""
+        entries = rm.compiler.active_loras(payload["request"].get("loras"),
+                                           compiled.checkpoint, self.id)
+        loras = []
+        for entry in entries:
+            if lora_mod.modality(entry):
+                return None, f"'{entry['name']}' has its audio dial turned down"
+            loras.append((entry["name"], float(entry.get("strength", 1.0))))
+        return loras, None
+
+    def plan(self, links, payload, compiled, sampling, run, acceleration):
+        """(loras, None) to sample on the cluster, or (None, why) for local.
+        Decided once per payload and remembered, so the segment node and the
+        sampler hook cannot disagree."""
+        memo = links._spark_plans
+        if id(payload) in memo:
+            return memo[id(payload)][1]
+        loras, why = cluster_loras(self, payload, compiled)
+        why = (why or accel_blocker(acceleration)
+               or run_blocker(compiled, run.within(sampling, compiled, payload),
+                              sampling, anchors_anywhere))
+        if why is None and not links.monarch.claims(Models.key(compiled.checkpoint, loras)):
+            why = "the cluster already holds another checkpoint or LoRA stack for this render"
+        decision = (loras, None) if why is None else (None, why)
+        memo[id(payload)] = (payload, decision)  # keep payload alive: id stays unique
+        if why is not None:
+            log.warning("Continuity: %s samples on this Spark, not the cluster: %s",
+                        label_of(payload), why)
+        else:
+            log.info("Continuity: %s samples on the cluster", label_of(payload))
+        return decision
 
     def weights_from_blob(self, data):
         weights = orig["weights_from_blob"](self, data)
@@ -303,53 +279,52 @@ def _wrap(cls, mods):
             return orig["preflight"](self, sampling, acceleration, weights)
         for node_id in REQUIRED_NODES:
             _require(node_id)
-        refuse_accel(acceleration)
+        # Local passes may still use the accelerators: let Continuity check
+        # their packs exactly as it does for one card.
+        weights._spark_accel = acceleration
+        return orig["preflight"](self, sampling, acceleration, local(weights))
 
     def emit_loaders(self, graph, weights, routes):
         if not enabled(weights):
             return orig["emit_loaders"](self, graph, weights, routes)
-        # The checkpoint is loaded by the workers from a filename, so the
-        # routed loaders are skipped; the text encoder and both VAEs still run
-        # here, as they do for Raylight.
-        refuse_weights(weights, routes)
-        links = rm.core.Links(graph, weights, routes, skip=rm.slots.ROUTED_SLOTS)
+        # Continuity's full loader table: the text encoder and VAEs run here
+        # either way, and the routed checkpoints wait for any local pass.
+        links = orig["emit_loaders"](self, graph, local(weights), routes)
         links.monarch = Models(graph, weights)
+        links._spark_plans = {}
         return links
 
-    def _segment_inputs(self, links, payload, compiled, weights, seams, splits, run):
+    def emit_segment(self, graph, links, payload, compiled, weights, sampling,
+                     seams, run):
         if not enabled(weights):
-            return orig["_segment_inputs"](self, links, payload, compiled,
-                                           weights, seams, splits, run)
-        # The segment node's distributed path is exactly ours: no MODEL
-        # sockets, outputs unwired, conditioning and latent only. Its input
-        # says 'raylight' because that is the one value it knows for "the
-        # transformer is elsewhere".
+            return orig["emit_segment"](self, graph, links, payload, compiled,
+                                        weights, sampling, seams, run)
+        loras, _ = plan(self, links, payload, compiled, sampling, run,
+                        getattr(weights, "_spark_accel", None))
+        if loras is None:
+            return orig["emit_segment"](self, graph, links, payload, compiled,
+                                        local(weights), sampling, seams, run)
+        # The segment node's distributed path is exactly the cluster's: no
+        # MODEL sockets, conditioning and latent only. 'raylight' is the one
+        # value it knows for "the transformer is elsewhere".
         remote = copy.copy(weights)
         remote.backend = rl.RAYLIGHT
+        return orig["emit_segment"](self, graph, links, payload, compiled,
+                                    remote, sampling, seams, run)
+
+    def _segment_inputs(self, links, payload, compiled, weights, seams, splits, run):
+        # Every caller hands the weights its pass runs on (see emit_segment);
+        # a cluster render reaching here as such is a local pass.
+        if enabled(weights):
+            weights = local(weights)
         return orig["_segment_inputs"](self, links, payload, compiled,
-                                       remote, seams, splits, run)
+                                       weights, seams, splits, run)
 
     def emit_control(self, graph, links, segment, compiled, weights, guide):
-        if enabled(weights):
-            refuse_guide()
+        # A guided generation is planned local, so its segment has a model.
         return orig["emit_control"](self, graph, links, segment, compiled,
-                                    weights, guide)
-
-    def _loras(self, payload, compiled):
-        entries = rm.compiler.active_loras(payload["request"].get("loras"),
-                                           compiled.checkpoint, self.id)
-        loras = []
-        for entry in entries:
-            if lora_mod.modality(entry):
-                raise ValueError(
-                    f"'{entry['name']}' has its audio dial turned down, which "
-                    f"slices the adapter's modulation rows: Continuity's own "
-                    f"LoRA stack does that, and dgx-monarch's LoRA loader "
-                    f"merges at one strength. Put the dial back to 1.0, "
-                    f"{_off_hint()}."
-                )
-            loras.append((entry["name"], float(entry.get("strength", 1.0))))
-        return loras
+                                    local(weights) if enabled(weights) else weights,
+                                    guide)
 
     def emit_sampler(self, graph, links, segment, payload, compiled, sampling,
                      acceleration, weights, seed, run):
@@ -357,32 +332,33 @@ def _wrap(cls, mods):
             return orig["emit_sampler"](self, graph, links, segment, payload,
                                         compiled, sampling, acceleration,
                                         weights, seed, run)
-        splits = run.within(sampling, compiled, payload)
-        progress = payload.get("progress") or {}
-        label = f"Segment {progress['index']}" if progress.get("index") else None
-        refuse_run(compiled, splits, sampling, label)
-        refuse_seam(compiled, getattr(payload_mod, "CORE_ANCHORS_ANYWHERE", False), label)
-
-        model = links.monarch.of(compiled.checkpoint, _loras(self, payload, compiled),
-                                 acceleration)
+        loras, _ = plan(self, links, payload, compiled, sampling, run, acceleration)
+        if loras is None:
+            return orig["emit_sampler"](self, graph, links, segment, payload,
+                                        compiled, sampling, acceleration,
+                                        local(weights), seed, run)
+        model = links.monarch.of(compiled.checkpoint, loras, acceleration)
         # cfg 1.0 on the distilled checkpoints skips the negative, as on one card.
         against = graph.node("ConditioningZeroOut", conditioning=segment.out(1)).out(0)
         # The one-node sampler, as dgx-monarch's own H3 template wires it: its
         # sigmas are computed once the mesh exists, so the Init node's 'auto'
-        # topology stands. The custom-sampler trio would need a preset
-        # topology, because its scheduler runs before the first attach.
-        # denoise 1.0: this is the first pass; the re-noising passes are
-        # refused above.
+        # topology stands (the custom-sampler trio needs a preset topology,
+        # because its scheduler runs before the first attach). denoise 1.0:
+        # this is the first pass; the re-noising passes run locally.
         return graph.node(KSAMPLER_NODE, model=model, seed=seed, steps=sampling.steps,
                           cfg=sampling.cfg, sampler_name=sampling.sampler_name,
                           scheduler=sampling.scheduler, positive=segment.out(1),
                           negative=against, latent_image=segment.out(2),
                           denoise=1.0).out(0)
 
+    # The passes after the first sample a crop or a re-noised latent against a
+    # real model, with Continuity's own stack and patches: always on this
+    # Spark, after the cluster has done the heavy pass.
     def emit_refine(self, graph, links, segment, payload, compiled, weights,
                     seams, latent, sampling, acceleration, seed, run):
         if enabled(weights):
-            refuse_pass("The two-pass upscale")
+            log.info("Continuity: the two-pass upscale samples on this Spark")
+            weights = local(weights)
         return orig["emit_refine"](self, graph, links, segment, payload, compiled,
                                    weights, seams, latent, sampling, acceleration,
                                    seed, run)
@@ -390,22 +366,29 @@ def _wrap(cls, mods):
     def emit_face(self, graph, links, payload, compiled, face, written, weights,
                   sampling, acceleration, seed):
         if enabled(weights):
-            refuse_pass("The face pass")
+            log.info("Continuity: the face pass samples on this Spark")
+            weights = local(weights)
         return orig["emit_face"](self, graph, links, payload, compiled, face,
                                  written, weights, sampling, acceleration, seed)
 
     def emit_seam_restore(self, graph, links, frames, payload, compiled, denoise,
                           *args, **kwargs):
-        if getattr(links, "monarch", None) is not None:
-            refuse_pass("The seam restore")
+        args = list(args)
+        for i, value in enumerate(args):
+            if enabled(value):
+                args[i] = local(value)
+        kwargs = {key: local(value) if enabled(value) else value
+                  for key, value in kwargs.items()}
         return orig["emit_seam_restore"](self, graph, links, frames, payload,
                                          compiled, denoise, *args, **kwargs)
 
-    for fn in (weights_from_blob, preflight, emit_loaders, _segment_inputs,
-               emit_control, emit_sampler, emit_refine, emit_face, emit_seam_restore):
+    for fn in (weights_from_blob, preflight, emit_loaders, emit_segment,
+               _segment_inputs, emit_control, emit_sampler, emit_refine,
+               emit_face, emit_seam_restore):
         fn.__wrapped__ = orig[fn.__name__]
         setattr(cls, fn.__name__, fn)
     cls._spark_monarch = True
+
 
 
 def _continuity_modules():
