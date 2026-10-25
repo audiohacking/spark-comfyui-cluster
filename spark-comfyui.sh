@@ -3279,6 +3279,16 @@ _cluster_install_shim() {
 $marker — written by '$0 cluster worker'.
 # dgx-monarch runs its per-host probes with cluster.toml's 'python'; this
 # runs them inside the worker container, which shares this host's /proc.
+#
+# stdin is forwarded only when it was redirected for THIS call (a heredoc or
+# a pipe: '"\$PYBIN" - <<EOF', '-c CODE <<EOF'). Probes arrive as
+# 'ssh host bash -s' with the script on stdin, so a plain '"\$PYBIN" -c ...'
+# inherits the rest of that script as its stdin, and 'docker exec -i' would
+# swallow it: every later probe line silently never runs.
+in0="\$(readlink /proc/self/fd/0 2>/dev/null || true)"
+if [[ -n "\$in0" && "\$in0" == "\$(readlink "/proc/\$PPID/fd/0" 2>/dev/null || true)" ]]; then
+  exec docker exec "$WORKER_NAME" python "\$@" </dev/null
+fi
 exec docker exec -i "$WORKER_NAME" python "\$@"
 EOF
   chmod 755 "$shim"
