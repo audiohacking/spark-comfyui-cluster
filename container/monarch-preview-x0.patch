@@ -1,3 +1,5 @@
+Only in b/src/dgx_monarch: __pycache__
+Only in b/src/dgx_monarch/actor: __pycache__
 diff -ru a/src/dgx_monarch/actor/sampling.py b/src/dgx_monarch/actor/sampling.py
 --- a/src/dgx_monarch/actor/sampling.py	2026-10-25 16:49:49.104531107 +0100
 +++ b/src/dgx_monarch/actor/sampling.py	2026-10-25 16:50:05.745001926 +0100
@@ -40,7 +42,7 @@ diff -ru a/src/dgx_monarch/actor/sampling.py b/src/dgx_monarch/actor/sampling.py
  
 diff -ru a/src/dgx_monarch/progress.py b/src/dgx_monarch/progress.py
 --- a/src/dgx_monarch/progress.py	2026-10-25 16:49:49.060531111 +0100
-+++ b/src/dgx_monarch/progress.py	2026-10-25 16:50:05.745105366 +0100
++++ b/src/dgx_monarch/progress.py	2026-10-25 22:28:48.806334429 +0100
 @@ -12,6 +12,11 @@
  
  log = get_logger(__name__)
@@ -53,7 +55,7 @@ diff -ru a/src/dgx_monarch/progress.py b/src/dgx_monarch/progress.py
  
  def _thread_started(thread: threading.Thread) -> bool:
      """Whether this thread got far enough through start() to join.
-@@ -100,6 +105,13 @@
+@@ -100,6 +105,17 @@
                  self._last_activity = time.monotonic()
                  if not isinstance(msg, dict) or msg.get("done"):
                      return
@@ -62,7 +64,11 @@ diff -ru a/src/dgx_monarch/progress.py b/src/dgx_monarch/progress.py
 +                if x0 is not None and sink is not None:
 +                    try:
 +                        sink(msg.get("step", 0), msg.get("total", self._total), x0)
-+                    except Exception as exc:
++                    except (KeyboardInterrupt, SystemExit):
++                        raise
++                    except BaseException as exc:
++                        # BaseException: ComfyUI's interrupt is one, and a
++                        # preview must never end this pump or a cancel with it.
 +                        log.debug("preview sink failed: %r", exc)
                  try:  # telemetry tap (dgxm top): never allowed to break the bar
                      from .telemetry import render_progress

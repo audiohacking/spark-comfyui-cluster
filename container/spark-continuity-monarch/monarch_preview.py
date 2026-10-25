@@ -173,6 +173,7 @@ def _run_with_preview(settings, latent_image, run):
         return run()
     import comfy.latent_formats
     import comfy.model_management
+    import comfy.model_management as mm
     import torch
     from dgx_monarch import progress
 
@@ -191,12 +192,21 @@ def _run_with_preview(settings, latent_image, run):
         def __call__(self, noise, latent_image_, sampler, sigmas, denoise_mask,
                      callback, disable_pbar, seed, latent_shapes=None):
             def sink(step, total, x0):
-                # The pump thread is outside ComfyUI's inference_mode, while
-                # the tiny VAE was loaded inside it (on the node's thread):
-                # decoding its inference tensors with autograd on fails and
-                # KJNodes falls back to latent2rgb. Same mode as the node.
-                with torch.inference_mode():
-                    callback(int(step) - 1, x0.to(device, torch.float32), None, int(total))
+                # A cancel belongs to dgx-monarch's cancel monitor, which polls
+                # ComfyUI's interrupt flag to stop the workers. ComfyUI's ops
+                # clear that flag when they raise it, so a preview decode
+                # running into it would swallow the cancel: skip the decode
+                # while one is pending, and put the flag back if a decode
+                # still trips it.
+                if mm.processing_interrupted():
+                    return
+                try:
+                    # The pump thread is outside ComfyUI's inference_mode while
+                    # the tiny VAE was loaded inside it; same mode as the node.
+                    with torch.inference_mode():
+                        callback(int(step) - 1, x0.to(device, torch.float32), None, int(total))
+                except mm.InterruptProcessingException:
+                    mm.interrupt_current_processing(True)
             progress.PREVIEW_SINK = sink
             try:
                 return run()
@@ -216,6 +226,28 @@ def _run_with_preview(settings, latent_image, run):
                    True, 0, shapes)
 
 
+def _unload_after_prompt():
+    """Have ComfyUI unload this process's models once the prompt is over.
+
+    On the driver Spark a cluster render's rank 0 shares memory with this
+    ComfyUI, which otherwise keeps the text encoder, the local passes' copy of
+    the model, the detector and the VAEs resident from render to render, until
+    dgx-monarch refuses the next one for capacity. This sets the same flag as
+    ComfyUI's own "free memory" (POST /free unload_models), which the prompt
+    worker applies between prompts, the only time unloading is safe. They
+    reload from the page cache when the next render needs them.
+    SPARK_MONARCH_UNLOAD_AFTER=0 keeps them resident.
+    """
+    if os.environ.get("SPARK_MONARCH_UNLOAD_AFTER", "1").strip() == "0":
+        return
+    try:
+        import server
+
+        server.PromptServer.instance.prompt_queue.set_flag("unload_models", True)
+    except Exception as exc:
+        log.debug("could not ask for an unload after this prompt: %r", exc)
+
+
 def wrap_sampler():
     """Wrap DGXMonarchKSampler.sample for a model carrying SparkMonarchPreview
     settings: the page-cache prefetch and the live preview. Renders without
@@ -233,6 +265,7 @@ def wrap_sampler():
             return orig(self, model, *args, **kwargs)
         if settings.get("prefetch"):
             _prefetch(settings["prefetch"])
+        _unload_after_prompt()
 
         def attempt():
             if not settings.get("preview"):
