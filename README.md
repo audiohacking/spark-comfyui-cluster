@@ -7,8 +7,8 @@
 
 **One script to install, run, update, and maintain [ComfyUI](https://github.com/Comfy-Org/ComfyUI) on the NVIDIA DGX Spark (GB10 Grace Blackwell), fully containerized.**
 
-[![CI](https://github.com/audiohacking/spark-comfyui/actions/workflows/ci.yml/badge.svg)](https://github.com/audiohacking/spark-comfyui/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/audiohacking/spark-comfyui?color=76B900)](LICENSE)
+[![CI](https://github.com/audiohacking/spark-comfyui-cluster/actions/workflows/ci.yml/badge.svg)](https://github.com/audiohacking/spark-comfyui-cluster/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/audiohacking/spark-comfyui-cluster?color=76B900)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-DGX_Spark_%C2%B7_GB10_%C2%B7_sm__121-76B900)
 ![Cluster](https://img.shields.io/badge/cluster-dgx--monarch-76B900)
 
@@ -39,11 +39,11 @@ What the fork adds:
 ### Getting it
 
 ```bash
-git clone https://github.com/audiohacking/spark-comfyui.git
-cd spark-comfyui
+git clone https://github.com/audiohacking/spark-comfyui-cluster.git
+cd spark-comfyui-cluster
 ```
 
-Clustering is on `main`. Next to an existing upstream install, clone into another folder (`git clone … spark-comfyui-cluster`) and see below. Then follow the [Quick start](#quick-start), or [Quick test: one Spark, then two](#quick-test-one-spark-then-two). `update` self-updates from this fork's `main`, not from upstream.
+Clustering is on `main`. The default clone folder, `spark-comfyui-cluster`, already differs from a stock checkout's `spark-comfyui`; give it its own names and port as below. Then follow the [Quick start](#quick-start), or [Quick test: one Spark, then two](#quick-test-one-spark-then-two). `update` self-updates from this fork's `main`, not from upstream.
 
 ### Next to an existing upstream install
 
@@ -82,8 +82,8 @@ Fork-only code lives in clearly marked places: the `cluster` Dockerfile stage, t
 Needs a DGX Spark (GB10) on DGX OS (docker, the NVIDIA Container Toolkit and the r580 driver ship with it), plus ~25 GB of disk before models.
 
 ```bash
-git clone https://github.com/audiohacking/spark-comfyui.git
-cd spark-comfyui
+git clone https://github.com/audiohacking/spark-comfyui-cluster.git
+cd spark-comfyui-cluster
 ./spark-comfyui.sh install          # one-time image build, about 5 min
 ./spark-comfyui.sh tune --persist   # recommended: swap off, persistence mode
 ./spark-comfyui.sh run              # UI at http://<spark-ip>:8188
@@ -487,7 +487,7 @@ On **both** Sparks:
 
 ```bash
 # 1. Clone at the SAME path on both ('cluster push' restarts B's worker by that path)
-git clone https://github.com/audiohacking/spark-comfyui.git ~/Documents/ComfyUI/spark-comfyui-cluster
+git clone https://github.com/audiohacking/spark-comfyui-cluster.git ~/Documents/ComfyUI/spark-comfyui-cluster
 cd ~/Documents/ComfyUI/spark-comfyui-cluster
 
 # 2. Only if a stock spark-comfyui runs on this Spark: own names and port
