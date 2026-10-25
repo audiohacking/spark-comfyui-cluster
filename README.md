@@ -708,6 +708,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | `SPARK_REMOTE_SCRIPT` | this path | Where `spark-comfyui.sh` lives on the other Sparks. |
 | `SPARK_CONTINUITY_MONARCH` | `1` | `0` keeps Continuity's H3 renders on the driver's card in cluster mode. |
 | `SPARK_MONARCH_SLAB` | `on` | Weight residency for Continuity cluster renders: `on` maps the model from the file on every Spark (less memory), `auto` or `off` uses dgx-monarch's default. |
+| `SPARK_MONARCH_NOTICES` | essentials | dgx-monarch's pop-up notices in ComfyUI: only warnings and errors by default. `all` shows every notice; all of them stay in the DGX Monarch panel either way. |
 
 ## Troubleshooting
 

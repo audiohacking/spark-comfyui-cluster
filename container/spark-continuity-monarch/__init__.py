@@ -31,6 +31,8 @@ except Exception:
     logging.getLogger("spark.continuity_monarch").exception(
         "Continuity cluster backend: no status route")
 
+monarch_preview.quiet_notices()
+
 if not continuity_monarch.install():
     try:
         import server

@@ -303,3 +303,34 @@ def wrap_sampler():
     setattr(cls, cls.FUNCTION, sample)
     cls._spark_preview_wrapped = True
     return True
+
+
+def quiet_notices():
+    """Toast only dgx-monarch notices that need attention (warn, error).
+
+    Its informational phase notices (first render, deferred NCCL and load,
+    the identity gate starting and passing, queue-time advice) still reach
+    the DGX Monarch panel, `dgxm top` and the log; only the canvas toast is
+    skipped, the same way dgx-monarch already skips it for the gate's proof
+    renders. Faults use another event and are untouched.
+    SPARK_MONARCH_NOTICES=all keeps every toast.
+    """
+    if os.environ.get("SPARK_MONARCH_NOTICES", "").strip().lower() == "all":
+        return False
+    try:
+        from dgx_monarch import first_render
+    except Exception:
+        return False
+    if getattr(first_render.notice, "_spark_quiet", False):
+        return True
+    orig = first_render.notice
+
+    def notice(phase, message, note, *, toast=True, severity="info", **kwargs):
+        if str(severity).lower() not in ("warn", "warning", "error"):
+            toast = False
+        return orig(phase, message, note, toast=toast, severity=severity, **kwargs)
+
+    notice._spark_quiet = True
+    notice.__wrapped__ = orig
+    first_render.notice = notice
+    return True
