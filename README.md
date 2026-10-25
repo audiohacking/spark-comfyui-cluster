@@ -709,6 +709,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | `SPARK_CONTINUITY_MONARCH` | `1` | `0` keeps Continuity's H3 renders on the driver's card in cluster mode. |
 | `SPARK_MONARCH_SLAB` | unset | Weight residency for Continuity cluster renders. Unset uses dgx-monarch's default; `on` maps the model from the file (less memory per Spark, but its first-use check needs extra memory on large renders). |
 | `SPARK_MONARCH_PREVIEW_FRAMES` | `17` | Frames in the live preview of a Continuity cluster render, spread across the clip. `0` previews every frame, which costs several seconds of GPU per step. |
+| `SPARK_MONARCH_UNLOAD_AFTER` | `1` | After each Continuity cluster render, the driver's ComfyUI unloads its models so the next render has the memory. `0` keeps them loaded. |
 | `SPARK_MONARCH_NOTICES` | essentials | dgx-monarch's pop-up notices in ComfyUI: only warnings and errors by default. `all` shows every notice; all of them stay in the DGX Monarch panel either way. |
 
 ## Troubleshooting
