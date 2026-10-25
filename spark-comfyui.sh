@@ -3209,6 +3209,8 @@ nccl_master_port = 29777
 #              worker containers heal through their docker restart policy.
 python = "~/$MONARCH_PY_REL"
 auto_heal = false
+# ComfyUI root inside the driver and worker containers (the image path).
+comfy_dir = "/opt/ComfyUI"
 # The cluster-only key 'cluster init' created. Inside the driver container
 # ~/.ssh is $CLUSTER_SSH_DIR, mounted read-only.
 ssh_key = "~/.ssh/id_ed25519"
@@ -3247,6 +3249,9 @@ gpus = 1
 # disable_pinned_memory = true
 # reserve_vram_gb = 8.0
 EOF
+  # Hosts, fabric and key paths: dgxm doctor warns on a group/world-readable
+  # config. The containers run as this same uid, so 0600 still reads.
+  chmod 600 "$CLUSTER_CONF"
   log "Seeded $CLUSTER_CONF"
   cat <<EOF
   Next, on the driver Spark:
