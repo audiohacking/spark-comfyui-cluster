@@ -168,7 +168,12 @@ def _run_with_preview(settings, latent_image, run):
         def __call__(self, noise, latent_image_, sampler, sigmas, denoise_mask,
                      callback, disable_pbar, seed, latent_shapes=None):
             def sink(step, total, x0):
-                callback(int(step) - 1, x0.to(device, torch.float32), None, int(total))
+                # The pump thread is outside ComfyUI's inference_mode, while
+                # the tiny VAE was loaded inside it (on the node's thread):
+                # decoding its inference tensors with autograd on fails and
+                # KJNodes falls back to latent2rgb. Same mode as the node.
+                with torch.inference_mode():
+                    callback(int(step) - 1, x0.to(device, torch.float32), None, int(total))
             progress.PREVIEW_SINK = sink
             try:
                 return run()
@@ -187,9 +192,45 @@ def _run_with_preview(settings, latent_image, run):
                    True, 0, shapes)
 
 
+def _mem_available_gib():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576
+    except OSError:
+        pass
+    return 0.0
+
+
+def _is_capacity_refusal(exc):
+    """dgx-monarch's pre-dispatch capacity refusals (class C): raised before
+    anything reaches the workers, so a retry after freeing memory is safe."""
+    return (type(exc).__name__ in ("StockLoadCapacityError", "DriverFootprintCapacityError")
+            or str(exc).startswith("[dgxm:C "))
+
+
+def _free_driver_models():
+    """Unload this ComfyUI's own models (text encoder, VAEs, detector) and
+    return the GiB that gave back to the host. They are idle while the cluster
+    samples and reload from the page cache when a later node needs them; on
+    unified memory this is memory rank 0 on this Spark can use."""
+    import gc
+
+    import comfy.model_management as mm
+
+    before = _mem_available_gib()
+    mm.unload_all_models()
+    gc.collect()
+    mm.soft_empty_cache(True)
+    return _mem_available_gib() - before
+
+
 def wrap_sampler():
-    """Wrap DGXMonarchKSampler.sample to honour a SparkMonarchPreview input.
-    Untouched renders (no preview attached) run exactly as before."""
+    """Wrap DGXMonarchKSampler.sample for a model carrying SparkMonarchPreview
+    settings: the page-cache prefetch, the live preview, and one retry after
+    freeing this ComfyUI's idle models when dgx-monarch refuses the render for
+    capacity. Renders without those settings run exactly as before."""
     import nodes
 
     cls = nodes.NODE_CLASS_MAPPINGS.get("DGXMonarchKSampler")
@@ -199,31 +240,47 @@ def wrap_sampler():
 
     def sample(self, model, *args, **kwargs):
         settings = getattr(model, "_spark_preview", None)
-        if not settings:
+        if settings is None:
             return orig(self, model, *args, **kwargs)
         if settings.get("prefetch"):
             _prefetch(settings["prefetch"])
-        if not settings.get("preview"):
-            return orig(self, model, *args, **kwargs)
-        started = []
 
-        def run():
-            started.append(True)
-            return orig(self, model, *args, **kwargs)
+        def attempt():
+            if not settings.get("preview"):
+                return orig(self, model, *args, **kwargs)
+            started = []
+
+            def run():
+                started.append(True)
+                return orig(self, model, *args, **kwargs)
+
+            try:
+                return _run_with_preview(settings["preview"] | {"node_id": settings.get("node_id")},
+                                         kwargs.get("latent_image"), run)
+            except Exception:
+                from dgx_monarch import progress
+
+                progress.PREVIEW_SINK = None
+                # A failure of the render is the render's to report. One of the
+                # preview set-up, before the render started, costs only the
+                # preview.
+                if started:
+                    raise
+                log.exception("Continuity: the cluster preview could not start; rendering without it")
+                return orig(self, model, *args, **kwargs)
 
         try:
-            return _run_with_preview(settings["preview"] | {"node_id": settings.get("node_id")},
-                                     kwargs.get("latent_image"), run)
-        except Exception:
-            from dgx_monarch import progress
-
-            progress.PREVIEW_SINK = None
-            # A failure of the render is the render's to report. One of the
-            # preview set-up, before the render started, costs only the preview.
-            if started:
+            return attempt()
+        except Exception as exc:
+            if not _is_capacity_refusal(exc):
                 raise
-            log.exception("Continuity: the cluster preview could not start; rendering without it")
-            return orig(self, model, *args, **kwargs)
+            freed = _free_driver_models()
+            if freed < 1.0:
+                raise
+            log.warning("Continuity: dgx-monarch refused the render for capacity; freed %.1f GiB "
+                        "of this ComfyUI's idle models (they reload when needed) and retrying once",
+                        freed)
+            return attempt()
 
     sample.__wrapped__ = orig
     setattr(cls, cls.FUNCTION, sample)
