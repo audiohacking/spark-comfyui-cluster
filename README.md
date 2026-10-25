@@ -444,7 +444,7 @@ ssh-keyscan -H 192.168.100.11 192.168.100.12 192.168.100.13 >> ~/.ssh/spark-comf
 ssh 192.168.100.12 true
 ```
 
-**3. Edit `spark-cluster.toml`.** Replace every `192.0.2.x` placeholder with the fabric IPs. Use one `[[hosts]]` block per Spark, the driver first, and the same `gpus = 1` everywhere. Name your NICs under `[fabric.generic-roce]`. Leave `python` and `auto_heal = false` as seeded: container mode depends on both, and `cluster status` warns if they change. A three-Spark switch looks like this:
+**3. Edit `spark-cluster.toml`.** Replace every `192.0.2.x` placeholder with the fabric IPs. Use one `[[hosts]]` block per Spark, the driver first, and the same `gpus = 1` everywhere. Name your NICs under `[fabric.generic-roce]`. Leave `python`, `auto_heal = false` and `comfy_dir` as seeded: container mode depends on both, and `cluster status` warns if they change. A three-Spark switch looks like this:
 
 ```toml
 [cluster]
@@ -455,6 +455,7 @@ nccl_master_addr   = "192.168.100.11"
 nccl_master_port   = 29777
 python             = "~/.local/share/spark-comfyui-cluster/python"
 auto_heal          = false
+comfy_dir          = "/opt/ComfyUI"   # ComfyUI inside the containers
 ssh_key            = "~/.ssh/id_ed25519"
 
 [[hosts]]
