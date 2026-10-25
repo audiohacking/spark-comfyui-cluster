@@ -38,17 +38,23 @@ seam-restore passes always sample here, with Continuity's own LoRA stack and
 patches, after the cluster has done the heavy pass. Every local decision is
 logged with its reason. LoRAs on the cluster are merged by dgx-monarch's
 loader rather than Continuity's own H3 stack.
+
+A cluster sampler carries Continuity's animated preview and a page-cache
+prefetch for the local passes' files: see monarch_preview.py.
 """
 
 from __future__ import annotations
 
 import copy
 import importlib
+import json
 import logging
 import os
 import sys
 
 log = logging.getLogger("spark.continuity_monarch")
+
+from . import monarch_preview  # noqa: E402  (driver-side preview glue)
 
 MONARCH = "monarch"
 
@@ -338,6 +344,7 @@ def _wrap(cls, mods):
                                         compiled, sampling, acceleration,
                                         local(weights), seed, run)
         model = links.monarch.of(compiled.checkpoint, loras, acceleration)
+        model = _with_preview(graph, model, weights, compiled)
         # cfg 1.0 on the distilled checkpoints skips the negative, as on one card.
         against = graph.node("ConditioningZeroOut", conditioning=segment.out(1)).out(0)
         # The one-node sampler, as dgx-monarch's own H3 template wires it: its
@@ -350,6 +357,28 @@ def _wrap(cls, mods):
                           scheduler=sampling.scheduler, positive=segment.out(1),
                           negative=against, latent_image=segment.out(2),
                           denoise=1.0).out(0)
+
+    def _with_preview(graph, model, weights, compiled):
+        """The sampler's model, carrying Continuity's animated preview settings
+        (read off its own graph_preview) and the files its local passes will
+        open, for monarch_preview to act on while the cluster samples."""
+        preview = None
+        if rm.core.preview_available():
+            preview = monarch_preview.capture_preview_kwargs(
+                rm.core, weights, rm.declare.RULES.fps)
+        prefetch = []
+        if any(getattr(compiled, name, None) for name in ("face", "refine", "redetail")):
+            for slot in (compiled.checkpoint, "sam3"):
+                try:
+                    name = weights.get(slot)
+                except Exception:
+                    name = None
+                if isinstance(name, str) and name:
+                    prefetch.append(name)
+        if not preview and not prefetch:
+            return model
+        spec = json.dumps({"preview": preview, "prefetch": prefetch}, sort_keys=True)
+        return graph.node(monarch_preview.NODE_ID, model=model, spec=spec).out(0)
 
     # The passes after the first sample a crop or a re-noised latent against a
     # real model, with Continuity's own stack and patches: always on this
@@ -420,7 +449,7 @@ def _compatible(mods):
     rl, rm = mods["raylight"], mods["render"]
     missing = [name for name in _HOOKS if not callable(getattr(rm.H3, name, None))]
     for module, attrs in ((rl, ("DEFAULT", "RAYLIGHT", "BACKENDS")),
-                          (rm, ("core", "slots", "compiler")),
+                          (rm, ("core", "slots", "compiler", "declare")),
                           (mods["lora"], ("modality",))):
         missing += [f"{module.__name__.rsplit('.', 1)[-1]}.{a}"
                     for a in attrs if not hasattr(module, a)]
@@ -450,6 +479,8 @@ def install():
         mods["raylight"].BACKENDS.append(MONARCH)
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
+    if not monarch_preview.wrap_sampler():
+        log.warning("Continuity: dgx-monarch's sampler is not loaded; cluster renders will not preview")
     _installed = True
     STATE.update(installed=True, reason="",
                  continuity=mods["raylight"].__name__[: -len(_RAYLIGHT)])

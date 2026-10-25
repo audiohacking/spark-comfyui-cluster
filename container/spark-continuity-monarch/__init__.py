@@ -14,8 +14,11 @@ import logging
 
 from . import continuity_monarch
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
+from . import monarch_preview
+
+# Built only inside Continuity's expanded graph (continuity_monarch.py).
+NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview}
+NODE_DISPLAY_NAME_MAPPINGS = {monarch_preview.NODE_ID: "Cluster preview (spark)"}
 
 try:
     import server

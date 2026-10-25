@@ -462,10 +462,21 @@ USER comfy
 # constraint so nothing can replace the cu130 build. torch-pins.txt already
 # carries those pins, local tag included, for ensure_torch_cuda. The
 # dependency checker failing fails the build, same policy as the mods.
+#
+# One local patch on top of the checkout: the result-leader worker adds each
+# step's x0 to the progress message it already sends, and the driver's pump
+# hands it to an optional sink. That is what lets spark-continuity-monarch
+# draw Continuity's animated taeh3 preview for a cluster render (upstream
+# streams step numbers only). Identical on every rank, like the rest of the
+# image. A MONARCH_REF it no longer applies to fails the build here, by name,
+# rather than shipping a cluster without previews.
+COPY --chown=comfy:0 container/monarch-preview-x0.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
  && git -C /opt/monarch-nodes/dgx-monarch checkout ${MONARCH_SHA} \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-preview-x0.patch \
+      || { echo "monarch-preview-x0.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
@@ -483,6 +494,7 @@ COPY --chown=comfy:0 container/monarch-paths.yaml /opt/spark/
 # Source files only: dgx-monarch's workers refuse bytecode imports.
 COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/continuity_monarch.py \
+     container/spark-continuity-monarch/monarch_preview.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/
