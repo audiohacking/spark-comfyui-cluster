@@ -67,6 +67,18 @@ Models go in `data/models/checkpoints` (etc.). No venv, no system Python changes
 
 Everything is an environment variable, so nothing needs editing to try something.
 
+### Running two installs on one Spark
+
+The defaults name one install per box: container and image `spark-comfyui`, cache volume `spark-comfyui-cache`, port `8188`. A second checkout (a fork, a test branch) needs its own of each. Put them in `spark-comfyui.env` next to the script, which is gitignored and read on every command:
+
+```bash
+CONTAINER_NAME=spark-comfyui-cluster
+CONTAINER_IMAGE=spark-comfyui-cluster   # also names the cache volume: spark-comfyui-cluster-cache
+PORT=8189
+```
+
+The file holds plain `KEY=VALUE` lines. It is parsed, not sourced, and a variable already set in the environment wins. The worker container follows `CONTAINER_NAME` (`spark-comfyui-cluster-worker`). `status` prints the names in effect, and `run`/`service` refuse a port another container or process already holds, naming who has it. `SPARK_ENV_FILE=PATH` points at a different file.
+
 ### Runtime
 
 Set at `run` or `service` time.
@@ -175,7 +187,7 @@ For several setups, keep one file each and pick one per invocation with `--mount
 ./spark-comfyui.sh --mounts ./nas-profile.conf status   # check what it resolves to
 ```
 
-The flag works with every command and must name a file that exists, so a typo fails loudly instead of quietly mounting the defaults. `MOUNTS_CONF=PATH` does the same thing as an environment variable. Use it on `backup` and `restore` too so they act on that setup. To run two setups at once, add `CONTAINER_NAME` and `PORT` overrides.
+The flag works with every command and must name a file that exists, so a typo fails loudly instead of quietly mounting the defaults. `MOUNTS_CONF=PATH` does the same thing as an environment variable. Use it on `backup` and `restore` too so they act on that setup. To run two setups at once, give each its own `CONTAINER_NAME`, `CONTAINER_IMAGE` and `PORT` (see [Running two installs on one Spark](#running-two-installs-on-one-spark)).
 
 ## Patch list (optional)
 

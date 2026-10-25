@@ -42,3 +42,7 @@ ARCHITECTURE.md
 
 # dgx-monarch cluster config (the cluster-mode switch; holds fabric addresses)
 spark-cluster.toml
+
+# Per-folder instance overrides (container/image name, port) so a second
+# checkout can run beside the stock install
+spark-comfyui.env

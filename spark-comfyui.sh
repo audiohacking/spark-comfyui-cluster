@@ -161,6 +161,36 @@ VERSION="2026.10.10.1"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 BASE_DIR="${BASE_DIR:-$(dirname "$SELF")}"
 
+# Per-folder overrides: spark-comfyui.env next to the script (gitignored).
+# The defaults below name ONE install per box (container and image
+# 'spark-comfyui', cache volume 'spark-comfyui-cache', port 8188), so a second
+# checkout on the same Spark — a fork, a test branch — collides with the first
+# on every one of them unless it is told otherwise. Writing that once here
+# beats remembering a prefix on every command:
+#   CONTAINER_NAME=spark-comfyui-cluster
+#   CONTAINER_IMAGE=spark-comfyui-cluster
+#   PORT=8189
+# Plain KEY=VALUE lines, parsed rather than sourced (nothing in it runs), and
+# the environment still wins, so a one-off PORT=... on the command line keeps
+# working. 'cluster push' passes the names to the other Sparks explicitly.
+SPARK_ENV_FILE="${SPARK_ENV_FILE:-$BASE_DIR/spark-comfyui.env}"
+if [[ -f "$SPARK_ENV_FILE" ]]; then
+  while IFS= read -r _l || [[ -n "$_l" ]]; do
+    _l="${_l#"${_l%%[![:space:]]*}"}"; _l="${_l%"${_l##*[![:space:]]}"}"
+    [[ -z "$_l" || "$_l" == \#* ]] && continue
+    [[ "$_l" =~ ^(export[[:space:]]+)?([A-Z_][A-Z0-9_]*)=(.*)$ ]] \
+      || { printf '[error] %s: not a KEY=VALUE line: %s\n' "$SPARK_ENV_FILE" "$_l" >&2; exit 1; }
+    _k="${BASH_REMATCH[2]}" _v="${BASH_REMATCH[3]}"
+    case "$_k" in
+      PATH|HOME|IFS|ENV|BASH_ENV|SHELLOPTS|LD_*|BASE_DIR|SELF|SPARK_ENV_FILE)
+        printf '[error] %s: %s cannot be set here\n' "$SPARK_ENV_FILE" "$_k" >&2; exit 1 ;;
+    esac
+    [[ "$_v" =~ ^\"(.*)\"$ || "$_v" =~ ^\'(.*)\'$ ]] && _v="${BASH_REMATCH[1]}"
+    [[ -n "${!_k+x}" ]] || export "$_k=$_v"
+  done < "$SPARK_ENV_FILE"
+  unset _l _k _v
+fi
+
 # All overridable via environment if you want them elsewhere.
 # Pinned, not tracking thu-ml/SageAttention's default branch: 3.x showed
 # mosaic artifacts on GB10 (a visual regression the live kernel test can't
@@ -1163,6 +1193,7 @@ cmd_status() {
 
   hdr "Versions"
   echo "  spark-comfyui: $VERSION"
+  echo "  instance: container $CONTAINER_NAME, image $CONTAINER_IMAGE, port $PORT$([[ -f "$SPARK_ENV_FILE" ]] && echo " (from $(basename "$SPARK_ENV_FILE"))")"
   if command -v docker >/dev/null 2>&1 \
        && docker image inspect "$CONTAINER_IMAGE:latest" >/dev/null 2>&1; then
     # The image label carries the commit (no host checkout exists).
@@ -2085,6 +2116,24 @@ _content_mount_args() {
   done
 }
 
+# Refuse to start onto a port another install already holds. Docker would
+# fail too, but only after creating the container, and with a bind error
+# that does not say WHICH install is in the way; in cluster mode (host
+# network) main.py would instead die inside a healthy-looking container.
+# Called after our own leftover container is removed, so any listener on
+# PORT is somebody else's.
+_port_guard() {
+  local who
+  who="$(docker ps --filter "publish=$PORT" --format '{{.Names}}' 2>/dev/null \
+    | grep -vx "$CONTAINER_NAME" | head -1 || true)"
+  if [[ -z "$who" ]] && command -v ss >/dev/null 2>&1 \
+     && [[ -n "$(ss -Hltn "sport = :$PORT" 2>/dev/null)" ]]; then
+    who="another process"
+  fi
+  [[ -z "$who" ]] || die "port $PORT is already in use by ${who} — give this install its own:
+PORT=<n> $0 ..., or PORT=<n> in $SPARK_ENV_FILE"
+}
+
 cmd_run() {
   need_docker
   if [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$")" ]]; then
@@ -2096,6 +2145,7 @@ cmd_run() {
   # on the name. A running one was handled above, so removing here is safe.
   # Same guard 'service' carries.
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  _port_guard
   _container_run_args
   log "Launching containerized ComfyUI on $(_ui_url) (Ctrl-C stops it)"
   # --rm: every launch starts from the immutable image; runtime pip state
@@ -2130,6 +2180,7 @@ cmd_service() {
   # service after a reboot) blocks the new run; a RUNNING one was handled
   # above, so removing here is safe.
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  _port_guard
   _container_run_args
   log "Starting containerized ComfyUI as a service (docker restart policy)"
   docker run -d --restart unless-stopped "${CRUN_ARGS[@]}" \
