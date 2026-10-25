@@ -441,13 +441,14 @@ ARG MONARCH_REPO=https://github.com/Deen-Media/dgx-monarch.git
 ARG MONARCH_SHA=main
 # openssh-client is for the driver side: before every attach dgx-monarch
 # probes each worker host over ssh (listener generation and proc id), and
-# 'dgxm doctor' reaches the hosts the same way.
+# 'dgxm doctor' reaches the hosts the same way. rsync only satisfies doctor's
+# package-sync row: container mode never runs 'dgxm up', the images move whole.
 USER root
 # /opt/monarch-nodes is created here, as root, because only root can give it
 # group 0: /opt carries no setgid bit, so a directory comfy creates lands in
 # group comfy and an arbitrary caller uid could not write it (caught by the
 # arbitrary-uid check, same as the runtime stage's three roots).
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client rsync \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o comfy -g 0 -m 2775 /opt/monarch-nodes
 USER comfy
@@ -499,4 +500,10 @@ RUN umask 002 \
 # untouched.
 RUN printf '%s\n' "import os; os.environ.setdefault('TRITON_PTXAS_PATH', '/usr/local/cuda/bin/ptxas')" \
       > /opt/comfyui-env/lib/python3.12/site-packages/spark-triton-ptxas.pth
+# The runtime stage sets NCCL_P2P_DISABLE=1 (a one-GPU box has no peer to
+# reach). Cross-Spark NCCL over ConnectX needs it unset, and dgxm doctor fails
+# a multi-host config while it is set. Empty is unset to both NCCL and the
+# doctor; an ENV, not an entrypoint unset, so 'docker exec' sessions (dgxm via
+# 'cluster dgxm') see it too. Cluster stage only: stand-alone keeps the 1.
+ENV NCCL_P2P_DISABLE=
 LABEL org.spark-comfyui.monarch-sha=${MONARCH_SHA}
