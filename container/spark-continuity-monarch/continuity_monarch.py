@@ -173,13 +173,15 @@ def attention_option(attention):
 
 
 def slab_option():
-    """The Init node's slab_weights for H3 renders: 'on' unless the deployment
-    says otherwise (SPARK_MONARCH_SLAB=auto|on|off). dgx-monarch's own 'auto'
-    keeps H3 on stock residency, a full host copy of the weights beside the
-    GPU copy on every rank, which on unified memory is the same pool; slab
-    maps the file instead, and the identity gate verifies the output. None
-    when this dgx-monarch has no such option."""
-    wanted = os.environ.get("SPARK_MONARCH_SLAB", "on").strip().lower()
+    """The Init node's slab_weights, only when the deployment asks
+    (SPARK_MONARCH_SLAB=auto|on|off); None leaves dgx-monarch's own default.
+    'on' maps the weights from the file instead of keeping a host copy, but
+    its identity gate needs room for both residencies at once, which large
+    renders do not have. None as well when this dgx-monarch has no such
+    option."""
+    wanted = os.environ.get("SPARK_MONARCH_SLAB", "").strip().lower()
+    if not wanted:
+        return None
     declared = (_require(INIT_NODE).INPUT_TYPES().get("optional") or {}).get("slab_weights")
     options = [str(option) for option in (declared[0] if declared else [])]
     return wanted if wanted in options else None
