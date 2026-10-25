@@ -43,13 +43,7 @@ git clone https://github.com/audiohacking/spark-comfyui.git
 cd spark-comfyui
 ```
 
-Until clustering is merged into `main`, it lives on the `cluster-monarch` branch:
-
-```bash
-git clone -b cluster-monarch https://github.com/audiohacking/spark-comfyui.git spark-comfyui-cluster
-```
-
-Then follow the [Quick start](#quick-start), or [Quick test: one Spark, then two](#quick-test-one-spark-then-two). `update` self-updates from the branch you cloned, so this fork's updates come from this fork.
+Clustering is on `main`. Next to an existing upstream install, clone into another folder (`git clone … spark-comfyui-cluster`) and see below. Then follow the [Quick start](#quick-start), or [Quick test: one Spark, then two](#quick-test-one-spark-then-two). `update` self-updates from this fork's `main`, not from upstream.
 
 ### Next to an existing upstream install
 
@@ -69,6 +63,8 @@ Two things stay shared on purpose. One is the BuildKit cache: both installs reus
 **Don't download your models again.** Point the new install at the existing `data/` before its first `run`. See [Sharing an existing data folder](#sharing-an-existing-data-folder).
 
 ### Following upstream
+
+This is a hard fork, and nothing goes back upstream. Upstream fixes still come in when you choose to take them:
 
 ```bash
 git remote add upstream https://github.com/bjarkebolding/spark-comfyui.git
@@ -491,8 +487,8 @@ On **both** Sparks:
 
 ```bash
 # 1. Clone at the SAME path on both ('cluster push' restarts B's worker by that path)
-git clone -b cluster-monarch https://github.com/audiohacking/spark-comfyui.git ~/spark-comfyui-cluster
-cd ~/spark-comfyui-cluster
+git clone https://github.com/audiohacking/spark-comfyui.git ~/Documents/ComfyUI/spark-comfyui-cluster
+cd ~/Documents/ComfyUI/spark-comfyui-cluster
 
 # 2. Only if a stock spark-comfyui runs on this Spark: own names and port
 cat > spark-comfyui.env <<'EOF'
@@ -527,7 +523,7 @@ Pass criteria: `doctor` is green, the UI loads, and a generation finishes on eac
 ip -br addr | grep 192.168.100.        # A's fabric IP is up
 ping -c2 192.168.100.12                 # B answers over the fabric
 ssh 192.168.100.12 docker info >/dev/null && echo ok   # passwordless ssh, docker without sudo on B
-ssh 192.168.100.12 test -x ~/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
+ssh 192.168.100.12 test -x ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
 ss -ltn | grep -E ':(26600|29777|8189)\b' || echo free  # ports free on A; run it on B too
 ```
 
@@ -548,7 +544,7 @@ ssh-keyscan -H 192.168.100.11 192.168.100.12 >> ~/.ssh/spark-cluster/known_hosts
 ${EDITOR:-nano} spark-cluster.toml
 
 # 3. the same file on B
-scp spark-cluster.toml 192.168.100.12:~/spark-comfyui-cluster/
+scp spark-cluster.toml 192.168.100.12:~/Documents/ComfyUI/spark-comfyui-cluster/
 
 # 4. build the cluster image, send it to B (this also starts B's worker), start A's worker
 ./spark-comfyui.sh update
