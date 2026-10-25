@@ -128,6 +128,27 @@ PORT=8182
 
 The file holds plain `KEY=VALUE` lines. It is parsed, not sourced, and a variable already set in the environment wins. The worker container follows `CONTAINER_NAME` (`spark-comfyui-cluster-worker`). `status` prints the names in effect, and `run`/`service` refuse a port another container or process already holds, naming who has it. `SPARK_ENV_FILE=PATH` points at a different file.
 
+Everything this checkout creates or acts on follows those names, so the two installs never touch each other:
+
+| Thing | This fork (with the file above) | Stock install |
+|---|---|---|
+| Containers | `spark-comfyui-cluster`, `spark-comfyui-cluster-worker` | `spark-comfyui` |
+| Images and tags | `spark-comfyui-cluster:latest`, `:previous`, `:keep-*` | `spark-comfyui:*` |
+| Cache volume | `spark-comfyui-cluster-cache` | `spark-comfyui-cache` |
+| UI port | 8182 (cluster: also 26600 worker, 29777 NCCL) | 8188 |
+| `status`, `stop`, monitor | this instance's container (or host process) only | its own |
+| `prune` of untagged images | images labelled `org.spark-comfyui.instance=spark-comfyui-cluster` | its own |
+| Boot tuning unit | `spark-comfyui-cluster-tune.service` | `comfyui-tune.service` |
+| Cluster ssh key | `~/.ssh/spark-comfyui-cluster/` | none |
+| dgx-monarch host state | `~/.local/state/spark-comfyui-cluster/` | none |
+| Host python shim | `~/.local/share/spark-comfyui-cluster/python` | none |
+| Content | `data/` in this checkout, or what `spark-mounts.conf` names | its own `data/` |
+
+The pieces of the host itself are shared because there is only one of each:
+- **The BuildKit cache.** It is left to the other install to trim, as noted under the quick test.
+- **The GPU and system tuning** (swap, clocks). `tune --revert` refuses while another install exists, because reverting would undo that install's tuning too.
+- **The models, if you choose to share them** ([Sharing an existing data folder](#sharing-an-existing-data-folder)).
+
 ### Runtime
 
 Set at `run` or `service` time.
@@ -410,9 +431,9 @@ This writes `spark-cluster.toml` (gitignored, never overwritten) and creates a d
 ```bash
 # a) the cluster key, on EVERY Spark including the driver itself
 #    (the driver probes its own worker by its fabric IP)
-ssh-copy-id -i ~/.ssh/spark-cluster/id_ed25519.pub you@192.168.100.12
+ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub you@192.168.100.12
 # b) the fabric addresses as known hosts for that key
-ssh-keyscan -H 192.168.100.11 192.168.100.12 192.168.100.13 >> ~/.ssh/spark-cluster/known_hosts
+ssh-keyscan -H 192.168.100.11 192.168.100.12 192.168.100.13 >> ~/.ssh/spark-comfyui-cluster/known_hosts
 # c) your OWN passwordless ssh from the driver host to every worker:
 #    'cluster push' and 'cluster status' use it, outside any container
 ssh 192.168.100.12 true
@@ -427,7 +448,7 @@ fabric_profile     = "generic-roce"
 transport_security = "trusted_fabric"
 nccl_master_addr   = "192.168.100.11"
 nccl_master_port   = 29777
-python             = "~/.local/share/spark-comfyui/python"
+python             = "~/.local/share/spark-comfyui-cluster/python"
 auto_heal          = false
 ssh_key            = "~/.ssh/id_ed25519"
 
@@ -477,7 +498,7 @@ Workers never build. dgx-monarch refuses to attach ranks whose sources differ, s
 ./spark-comfyui.sh cluster worker
 ```
 
-This finds the `[[hosts]]` row whose IP is local, starts the worker container, and installs `~/.local/share/spark-comfyui/python` on the host. That's a shim into the worker container, and dgx-monarch's probe uses it over ssh to read the worker's identity before every attach. `docker ps` shows the worker `healthy` once its loop listens. Set `SPARK_WORKER_ADDRESS=tcp://IP:26600` if `hostname -I` doesn't list the fabric IP.
+This finds the `[[hosts]]` row whose IP is local, starts the worker container, and installs `~/.local/share/spark-comfyui-cluster/python` on the host. That's a shim into the worker container, and dgx-monarch's probe uses it over ssh to read the worker's identity before every attach. `docker ps` shows the worker `healthy` once its loop listens. Set `SPARK_WORKER_ADDRESS=tcp://IP:26600` if `hostname -I` doesn't list the fabric IP.
 
 **7. Check, then start ComfyUI:**
 
@@ -525,17 +546,17 @@ echo "models = ~/Documents/ComfyUI/spark-comfyui/data/models" > spark-mounts.con
 Pass criteria: `doctor` is green, the UI loads, and a generation finishes on each Spark. The stock container, if there is one, is still `Up` in `docker ps`. If you plan to time the cluster later, also run the MiniMax H3 workflow you will cluster here, on A alone, and note the time. Stop with Ctrl-C.
 
 > [!NOTE]
-> `install` and `update` trim the BuildKit cache, which a stock install on the same Spark shares, to `CACHE_MAX_GB` (40 GB). That cache only makes rebuilds faster. It never affects a running container or an image.
+> The BuildKit cache belongs to docker, so a stock install on the same Spark shares it. While another install's images exist, this checkout's `install`, `update` and `prune` leave the cache alone and say so. The stock install's own `update` keeps trimming it. Set `CACHE_TRIM_SHARED=1` to trim from here anyway.
 
 #### Phase 2: clustered
 
-**Pre-flight**, from A. Each line must succeed before going on (`192.168.100.11` is A's fabric IP and `192.168.100.12` is B's; use yours):
+**Pre-flight**, from A. Each line must succeed before going on (`192.168.100.10` is A's fabric IP and `192.168.100.11` is B's; use yours):
 
 ```bash
 ip -br addr | grep 192.168.100.        # A's fabric IP is up
-ping -c2 192.168.100.12                 # B answers over the fabric
-ssh 192.168.100.12 docker info >/dev/null && echo ok   # passwordless ssh, docker without sudo on B
-ssh 192.168.100.12 test -x ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
+ping -c2 192.168.100.11                 # B answers over the fabric
+ssh 192.168.100.11 docker info >/dev/null && echo ok   # passwordless ssh, docker without sudo on B
+ssh 192.168.100.11 test -x ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
 ss -ltn | grep -E ':(26600|29777|8182)\b' || echo free  # ports free on A; run it on B too
 ```
 
@@ -546,17 +567,17 @@ If your user name differs on B, add `ssh_user = "name"` to B's `[[hosts]]` block
 ```bash
 # 1. config + cluster key
 ./spark-comfyui.sh cluster init
-ssh-copy-id -i ~/.ssh/spark-cluster/id_ed25519.pub 192.168.100.11   # A itself
-ssh-copy-id -i ~/.ssh/spark-cluster/id_ed25519.pub 192.168.100.12   # B
-ssh-keyscan -H 192.168.100.11 192.168.100.12 >> ~/.ssh/spark-cluster/known_hosts
+ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub 192.168.100.10   # A itself
+ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub 192.168.100.11   # B
+ssh-keyscan -H 192.168.100.10 192.168.100.11 >> ~/.ssh/spark-comfyui-cluster/known_hosts
 
-# 2. edit spark-cluster.toml: the 192.0.2.x placeholders -> 192.168.100.11 (first) and .12,
+# 2. edit spark-cluster.toml: the 192.0.2.x placeholders -> 192.168.100.10 (first) and .12,
 #    fabric_profile = "dgx-spark-pair" for one direct cable, or "generic-roce" + NIC names
 #    for a switch (see the example above; 'ibdev2netdev' lists the NICs)
 ${EDITOR:-nano} spark-cluster.toml
 
 # 3. the same file on B
-scp spark-cluster.toml 192.168.100.12:~/Documents/ComfyUI/spark-comfyui-cluster/
+scp spark-cluster.toml 192.168.100.11:~/Documents/ComfyUI/spark-comfyui-cluster/
 
 # 4. build the cluster image, send it to B (this also starts B's worker), start A's worker
 ./spark-comfyui.sh update
@@ -569,10 +590,10 @@ scp spark-cluster.toml 192.168.100.12:~/Documents/ComfyUI/spark-comfyui-cluster/
 ```bash
 ./spark-comfyui.sh cluster status       # both hosts: worker healthy, SAME image ID and monarch commit, no WARN
 ./spark-comfyui.sh cluster dgxm doctor  # dgx-monarch's own checks, all green
-ssh -i ~/.ssh/spark-cluster/id_ed25519 192.168.100.12 '~/.local/share/spark-comfyui/python -c "print(1)"'   # prints 1
+ssh -i ~/.ssh/spark-comfyui-cluster/id_ed25519 192.168.100.11 '~/.local/share/spark-comfyui-cluster/python -c "print(1)"'   # prints 1
 ```
 
-B's worker can stay `starting` for a few minutes on its first start (node requirements and GPU checks). `ssh 192.168.100.12 docker logs -f spark-comfyui-cluster-worker` shows its progress.
+B's worker can stay `starting` for a few minutes on its first start (node requirements and GPU checks). `ssh 192.168.100.11 docker logs -f spark-comfyui-cluster-worker` shows its progress.
 
 **Render:**
 
@@ -623,7 +644,7 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 
 ### Cluster troubleshooting
 
-- **Attach refused: listener not found / identity mismatch**: the driver's ssh probe could not read that worker. Run `ssh -i ~/.ssh/spark-cluster/id_ed25519 <ip> ~/.local/share/spark-comfyui/python -c 'print(1)'` from the driver host. It must print `1`. A failure means the key, known_hosts, the shim, or a worker that isn't running.
+- **Attach refused: listener not found / identity mismatch**: the driver's ssh probe could not read that worker. Run `ssh -i ~/.ssh/spark-comfyui-cluster/id_ed25519 <ip> ~/.local/share/spark-comfyui-cluster/python -c 'print(1)'` from the driver host. It must print `1`. A failure means the key, known_hosts, the shim, or a worker that isn't running.
 - **Attach refused: source mismatch**: the hosts run different images. `cluster status` shows which one, and `cluster push` fixes it.
 - **NCCL hangs or picks the wrong NIC**: set `NCCL_SOCKET_IFNAME` and `NCCL_IB_HCA` under `[fabric.generic-roce]`, then `cluster worker --restart` everywhere. Add `NCCL_DEBUG = "INFO"` there to see what NCCL chose.
 - **A worker stays `starting`**: `docker logs <CONTAINER_NAME>-worker`. The worker installs custom-node requirements and runs the same GPU checks as ComfyUI before it listens, so the first start takes a few minutes.
@@ -637,7 +658,7 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 | `SPARK_CLUSTER` | unset | `0` forces stand-alone even with the file present. |
 | `MONARCH_REF` | newest `vX.Y.Z` | dgx-monarch tag, branch or commit to build. |
 | `MONARCH_REPO` | upstream | dgx-monarch git URL, for a fork. |
-| `CLUSTER_SSH_DIR` | `~/.ssh/spark-cluster` | The driver container's ssh identity. |
+| `CLUSTER_SSH_DIR` | `~/.ssh/$CONTAINER_NAME` | The driver container's ssh identity. |
 | `WORKER_NAME` | `<CONTAINER_NAME>-worker` | This Spark's worker container. |
 | `SPARK_WORKER_ADDRESS` | from the config | This Spark's worker bind, when `hostname -I` does not list its fabric IP. |
 | `SPARK_REMOTE_SCRIPT` | this path | Where `spark-comfyui.sh` lives on the other Sparks. |

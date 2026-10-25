@@ -412,6 +412,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
 # the list rebuilds a few bytes instead of the mods and torch-pin layers.
 COPY --chown=comfy:0 container/default-nodes.list /opt/spark/
 
+# Which install built this image (its CONTAINER_IMAGE). Several installs can
+# share one Spark (this fork beside the stock spark-comfyui), and they all
+# set comfy-sha, so 'prune' tells its own untagged leftovers apart by this.
+# Last in the stage: a label is metadata only and rebuilds nothing.
+ARG SPARK_INSTANCE=spark-comfyui
+LABEL org.spark-comfyui.instance=${SPARK_INSTANCE}
+
 ENTRYPOINT ["/opt/spark/entrypoint.sh"]
 
 # --------------------------------------------------------------------------
@@ -473,10 +480,10 @@ COPY --chown=comfy:0 container/monarch-paths.yaml /opt/spark/
 # The mountpoints are created here owned by comfy:0, so docker does not
 # create them as root at launch.
 RUN umask 002 \
- && mkdir -p /home/comfy/.local/share/spark-comfyui \
+ && mkdir -p /home/comfy/.local/share/spark-comfyui-cluster \
              /home/comfy/.local/state/dgx-monarch \
              /home/comfy/.config/dgx-monarch \
- && ln -s /opt/comfyui-env/bin/python /home/comfy/.local/share/spark-comfyui/python
+ && ln -s /opt/comfyui-env/bin/python /home/comfy/.local/share/spark-comfyui-cluster/python
 # The worker loop filters its environment to an allowlist before Monarch
 # spawns actors (dgx-monarch cli/worker_process_env.py), and TRITON_PTXAS_PATH
 # is not on it, so the actors lose it (measured in-image) and any Triton JIT

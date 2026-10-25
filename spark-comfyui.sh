@@ -327,14 +327,29 @@ SPARK_REMOTE_SCRIPT="${SPARK_REMOTE_SCRIPT:-}"
 # cluster.toml's 'python'. dgx-monarch runs its per-host probes with that one
 # path on every host: inside the driver container it is a symlink baked into
 # the image, on the host it is a shim into the worker container that
-# 'cluster worker' installs. '~' is expanded by dgx-monarch, per side.
-readonly MONARCH_PY_REL=".local/share/spark-comfyui/python"
+# 'cluster worker' installs. '~' is expanded by dgx-monarch, per side. Named
+# after the fork, so the host side never lands in a path the stock install
+# could own.
+readonly MONARCH_PY_REL=".local/share/spark-comfyui-cluster/python"
 # The ssh identity the DRIVER container uses for dgx-monarch's per-host
 # probes, mounted read-only as its ~/.ssh. A dedicated directory and not your
 # ~/.ssh on purpose: custom nodes run in that same container, and the
 # confinement promise is that they cannot read your keys. 'cluster init'
 # creates it with a fresh cluster-only key and a copy of your known_hosts.
-CLUSTER_SSH_DIR="${CLUSTER_SSH_DIR:-$HOME/.ssh/spark-cluster}"
+# Per instance, like every other host-side name.
+CLUSTER_SSH_DIR="${CLUSTER_SSH_DIR:-$HOME/.ssh/$CONTAINER_NAME}"
+# dgx-monarch's host-side state (actor ledger, generation marker, memos),
+# shared by this instance's driver and worker containers only. The containers
+# see it at dgx-monarch's own fixed paths.
+CLUSTER_STATE_DIR="${CLUSTER_STATE_DIR:-$HOME/.local/state/$CONTAINER_NAME}"
+# The boot-time tuning unit. The default install keeps its historical name;
+# any other instance gets its own, so persisting or reverting from one never
+# rewrites or removes the other's unit.
+if [[ "$CONTAINER_NAME" == spark-comfyui ]]; then
+  TUNE_UNIT=comfyui-tune.service
+else
+  TUNE_UNIT="$CONTAINER_NAME-tune.service"
+fi
 
 # User content inside the ComfyUI tree: what reset holds aside while it
 # wipes and reinstalls everything else. backup/restore cover the same set
@@ -498,15 +513,21 @@ $BASE_DIR?) — continuing with the current version. To update manually:
 # skip-if-already-in-the-target-state rule as tune, so a second --revert asks
 # for no password it does not need.
 _tune_revert() {
+  # Tuning is host-wide, shared by every install on this Spark, and the
+  # unit name is the same for all of them.
+  local others
+  others="$(_other_instances)"
+  [[ -z "$others" || "${SPARK_TUNE_SHARED:-0}" == 1 ]] \
+    || die "another install shares this Spark's tuning ($others); revert it from there, or SPARK_TUNE_SHARED=1 to do it from here"
   log "Reverting DGX Spark system tuning"
 
   # 1) The persisted unit, if --persist ever wrote one.
-  local unit=/etc/systemd/system/comfyui-tune.service
+  local unit="/etc/systemd/system/$TUNE_UNIT"
   if [[ -f "$unit" ]]; then
-    sudo systemctl disable --now comfyui-tune.service >/dev/null 2>&1 || true
+    sudo systemctl disable --now "$TUNE_UNIT" >/dev/null 2>&1 || true
     sudo rm -f "$unit"
     sudo systemctl daemon-reload
-    echo "  comfyui-tune.service removed (tuning no longer re-applies at boot)"
+    echo "  $TUNE_UNIT removed (tuning no longer re-applies at boot)"
   else
     echo "  no persisted tuning unit"
   fi
@@ -640,7 +661,7 @@ cmd_tune() {
 
   # 4) Optionally persist across reboots (swapoff and -lgc do not survive).
   if [[ "$persist" -eq 1 ]]; then
-    local unit=/etc/systemd/system/comfyui-tune.service lgc_line=""
+    local unit="/etc/systemd/system/$TUNE_UNIT" lgc_line=""
     if [[ -n "$clock_cap" ]]; then
       lgc_line="ExecStart=/usr/bin/nvidia-smi -lgc 300,$clock_cap"
     elif [[ -f "$unit" ]]; then
@@ -666,8 +687,8 @@ $lgc_line
 WantedBy=multi-user.target
 UNIT
     sudo systemctl daemon-reload
-    sudo systemctl enable comfyui-tune.service >/dev/null
-    echo "  tuning persisted across reboots (comfyui-tune.service)"
+    sudo systemctl enable "$TUNE_UNIT" >/dev/null
+    echo "  tuning persisted across reboots ($TUNE_UNIT)"
   else
     warn "the swap-off and clock-cap settings do NOT survive a reboot on their
 own (vm.swappiness above already does) — add --persist to make all of it permanent"
@@ -865,6 +886,38 @@ print("\t".join(str(x) for x in (gen, act, flag, fin, fid, cache, depth, its, ",
 ' "$1" 2>/dev/null
 }
 
+# ComfyUI server pids that belong to THIS instance, python first. Container
+# processes sit in the host process table, so a bare pgrep also finds every
+# other install's container on this Spark (the stock spark-comfyui next to
+# this fork, say), and status, monitor and stop must never act on those. Our
+# own container is asked by name; with it down, only host processes count:
+# anything inside some container's cgroup belongs to someone else.
+_own_comfy_pids() {
+  local pid
+  if command -v docker >/dev/null 2>&1 \
+     && [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$" 2>/dev/null)" ]]; then
+    docker top "$CONTAINER_NAME" -eo pid,args 2>/dev/null \
+      | awk 'NR > 1 && /main\.py --listen/ {print ($2 ~ /python/ ? "0 " : "1 ") $1}' \
+      | sort -n | cut -d' ' -f2
+    return 0
+  fi
+  for pid in $(pgrep -f 'main.py --listen' 2>/dev/null); do
+    grep -qE 'docker|containerd|libpod' "/proc/$pid/cgroup" 2>/dev/null && continue
+    [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == python* ]] && echo "0 $pid" || echo "1 $pid"
+  done | sort -n | cut -d' ' -f2
+  return 0
+}
+
+# One pid's command line, for flag checks (use-sage-attention).
+_pid_args() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true; }
+
+# Other spark-comfyui installs on this host, by image repository. They share
+# the docker builder's BuildKit cache and the host-wide tuning with this one.
+_other_instances() {
+  docker images --filter label=org.spark-comfyui.comfy-sha --format '{{.Repository}}' 2>/dev/null \
+    | grep -vx -e "$CONTAINER_IMAGE" -e '<none>' | sort -u | paste -sd' ' || true
+}
+
 cmd_status() {
   # --watch: live dashboard (sparkline timeseries per metric) + an append-only
   # log line per sample. The LOG is the actual point: it survives the silent
@@ -978,20 +1031,14 @@ cmd_status() {
       prev_io="$io_now"; prev_ts="$now_ts"
       # Prefer the actual python server over wrapper shells whose command
       # line merely contains the launch string (bash -c, script(1), sudo…).
-      pid=""
-      for cand in $(pgrep -f 'main.py --listen' 2>/dev/null); do
-        pid="${pid:-$cand}"   # fallback: first match
-        if [[ "$(cat "/proc/$cand/comm" 2>/dev/null)" == python* ]]; then
-          pid="$cand"; break
-        fi
-      done
+      pid="$(_own_comfy_pids | head -1)"
       rss='-'
       if [[ -n "$pid" ]]; then
         rss="$(awk '/^VmRSS:/ {printf "%.1f", $2/1048576}' "/proc/$pid/status" 2>/dev/null || true)"
         [[ -n "$rss" ]] || rss='-'
         # The attention backend is the classic A/B dimension, so it lives in
         # the section header as run context.
-        if pgrep -af 'main.py --listen' 2>/dev/null | grep -q 'use-sage-attention'
+        if [[ "$(_pid_args "$pid")" == *use-sage-attention* ]]
         then gen_hdr="GENERATION · SageAttention"
         else gen_hdr="GENERATION · SDPA"; fi
       else
@@ -1159,11 +1206,10 @@ cmd_status() {
   fi
 
   hdr "Process"
-  if pgrep -f "main.py --listen" >/dev/null 2>&1; then
-    local pid where=""
-    pid="$(pgrep -f 'main.py --listen' | head -1)"
-    # Container processes are visible in the host process table, so the
-    # same pgrep finds both worlds; the tag says which one this is.
+  local pid
+  pid="$(_own_comfy_pids | head -1)"
+  if [[ -n "$pid" ]]; then
+    local where=""
     if command -v docker >/dev/null 2>&1 \
        && [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$" 2>/dev/null)" ]]; then
       where=", containerized"
@@ -1183,7 +1229,7 @@ cmd_status() {
       cargs="$(docker inspect -f '{{join .Args " "}}' "$CONTAINER_NAME" 2>/dev/null || true)"
       [[ -z "$cargs" ]] || echo "  extra args: $cargs"
     fi
-    pgrep -af "main.py --listen" | grep -q "use-sage-attention" \
+    [[ "$(_pid_args "$pid")" == *use-sage-attention* ]] \
       && echo "  attention: SageAttention" || echo "  attention: PyTorch SDPA"
   else
     echo "  ComfyUI not running (start: $0 run)"
@@ -1256,6 +1302,7 @@ cmd_status() {
 #  stop
 # =============================================================================
 cmd_stop() {
+  local pids
   if command -v docker >/dev/null 2>&1 \
        && [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$" 2>/dev/null)" ]]; then
     # docker stop, never pkill — the container python matches the pkill
@@ -1264,8 +1311,11 @@ cmd_stop() {
     # it.
     docker stop "$CONTAINER_NAME" >/dev/null
     echo "container stopped"
-  elif pgrep -f "main.py --listen" >/dev/null 2>&1; then
-    pkill -f "main.py --listen"
+  elif pids="$(_own_comfy_pids)" && [[ -n "$pids" ]]; then
+    # Only our own host processes: a pkill on the pattern would also hit
+    # another install's container on this Spark.
+    # shellcheck disable=SC2086
+    kill $pids
     echo "ComfyUI process stopped"
   else
     echo "ComfyUI is not running"
@@ -1723,6 +1773,7 @@ _image_build_args() {
     --build-arg COMFY_SHA="$1"
     --build-arg SAGE_REF="$SAGE_REF"
     --build-arg ORT_WHEEL_URL="$ORT_WHEEL_URL"
+    --build-arg SPARK_INSTANCE="$CONTAINER_IMAGE"
   )
   # The monarch pair only when a sha was resolved. It is consumed by the
   # 'cluster' stage alone, so passing it to a runtime build would change
@@ -1839,12 +1890,15 @@ _orphan_tags() {
 
 # Untagged leftovers are invisible to a repository filter, so match them by
 # our own image label rather than running a global 'docker image prune',
-# which would also reap other projects' images on this host.
+# which would also reap other projects' images on this host. comfy-sha alone
+# is not ours: every spark-comfyui install sets it, the stock one beside this
+# fork included, so the instance label (CONTAINER_IMAGE at build time) must
+# match too. Untagged images from before that label are left alone.
 _orphan_dangling() {
   local id
   docker images -f dangling=true -q 2>/dev/null | sort -u | while read -r id; do
-    [[ -n "$(docker image inspect -f \
-      '{{index .Config.Labels "org.spark-comfyui.comfy-sha"}}' "$id" 2>/dev/null)" ]] \
+    [[ "$(docker image inspect -f \
+      '{{index .Config.Labels "org.spark-comfyui.instance"}}' "$id" 2>/dev/null)" == "$CONTAINER_IMAGE" ]] \
       && echo "$id"
   done
   return 0
@@ -1888,9 +1942,17 @@ _build_cache_gb() {
 # Never fatal: a failed trim costs disk, not a working install, and must not
 # sink an otherwise good update.
 prune_build_cache() {
-  local before after
+  local before after others
   before="$(_build_cache_gb)"
   (( before > 0 )) || return 0
+  # The cache belongs to the docker builder, not to this install: an LRU
+  # trim from here evicts the other install's layers too. Leave it to that
+  # install's own update unless told otherwise.
+  others="$(_other_instances)"
+  if [[ -n "$others" && "${CACHE_TRIM_SHARED:-0}" != 1 ]]; then
+    info "build cache is shared with: $others — not trimming it from here (CACHE_TRIM_SHARED=1 to do it anyway)"
+    return 0
+  fi
   # Pass 1: drop what has not been touched in CACHE_KEEP_DAYS. Bounds
   # staleness when rebuilds are rare; reclaims nothing at a daily cadence,
   # where every layer keeps getting re-used.
@@ -2021,8 +2083,8 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
   # driver and worker containers on this host: the actor ledger and generation
   # marker (state), consent and model-family memos (cache).
   for dir in .local/state/dgx-monarch .cache/dgx-monarch; do
-    mkdir -p "$HOME/$dir"
-    CRUN_ARGS+=(-v "$HOME/$dir:/home/comfy/$dir")
+    mkdir -p "$CLUSTER_STATE_DIR/$dir"
+    CRUN_ARGS+=(-v "$CLUSTER_STATE_DIR/$dir:/home/comfy/$dir")
   done
   CRUN_ARGS+=(
     -v "$CLUSTER_CONF:/home/comfy/.config/dgx-monarch/cluster.toml:ro"
