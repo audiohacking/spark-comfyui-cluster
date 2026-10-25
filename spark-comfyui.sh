@@ -2125,6 +2125,8 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
   # (the image's spark-continuity-monarch overlay); 0 keeps them on this card.
   [[ -z "${SPARK_CONTINUITY_MONARCH:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_CONTINUITY_MONARCH=$SPARK_CONTINUITY_MONARCH")
+  [[ -z "${SPARK_MONARCH_SLAB:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_MONARCH_SLAB=$SPARK_MONARCH_SLAB")
   if [[ "$role" == worker ]]; then
     CRUN_ARGS+=(
       -e SPARK_ROLE=worker

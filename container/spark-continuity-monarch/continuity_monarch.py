@@ -172,6 +172,19 @@ def attention_option(attention):
     return next((option for option in options if "SAGE" in option.upper()), None)
 
 
+def slab_option():
+    """The Init node's slab_weights for H3 renders: 'on' unless the deployment
+    says otherwise (SPARK_MONARCH_SLAB=auto|on|off). dgx-monarch's own 'auto'
+    keeps H3 on stock residency, a full host copy of the weights beside the
+    GPU copy on every rank, which on unified memory is the same pool; slab
+    maps the file instead, and the identity gate verifies the output. None
+    when this dgx-monarch has no such option."""
+    wanted = os.environ.get("SPARK_MONARCH_SLAB", "on").strip().lower()
+    declared = (_require(INIT_NODE).INPUT_TYPES().get("optional") or {}).get("slab_weights")
+    options = [str(option) for option in (declared[0] if declared else [])]
+    return wanted if wanted in options else None
+
+
 class Models:
     """The cluster's model for this render: one mesh, one transformer, one
     LoRA stack, built on the first generation that samples there. A later
@@ -204,6 +217,13 @@ class Models:
         for node_id in REQUIRED_NODES:
             _require(node_id)
         init = {"topology": "auto", "mode": "auto"}
+        slab = slab_option()
+        if slab is not None:
+            init["slab_weights"] = slab
+            if slab == "on":
+                # dgx-monarch's 'advanced' residency profile for a homogeneous
+                # unified-memory fleet sets these two together; slab needs it.
+                init["lora_low_rss"] = "on"
         chosen = attention_option(getattr(acceleration, "attention", "default"))
         if chosen is not None:
             init["attention"] = chosen
