@@ -85,7 +85,15 @@ if [[ "${SPARK_ROLE:-driver}" == "worker" || "${SPARK_MONARCH:-0}" == "1" ]]; th
   fi
 fi
 nodes_list=/opt/spark/comfyui-nodes.list
-if [[ ! -f "$nodes_list" ]]; then
+# The fork's default nodes (Continuity), baked into the image and read after
+# the user's list through the same parser and installer. SPARK_DEFAULT_NODES=0
+# skips them.
+default_nodes_list=/opt/spark/default-nodes.list
+node_lists=()
+[[ -f "$nodes_list" ]] && node_lists+=("$nodes_list")
+[[ "${SPARK_DEFAULT_NODES:-1}" != "0" && -f "$default_nodes_list" ]] \
+  && node_lists+=("$default_nodes_list")
+if (( ${#node_lists[@]} == 0 )); then
   info "no node list mounted — nothing to reconcile"
 else
   node_entries=()
@@ -101,8 +109,10 @@ else
       warn "ignoring malformed node-list entry: $line"
       continue
     fi
+    # The same node in both lists is one entry, not two installs.
+    [[ " ${node_entries[*]} " == *" $line "* ]] && continue
     node_entries+=("$line")
-  done < "$nodes_list"
+  done < <(cat "${node_lists[@]}")
 
   if (( ${#node_entries[@]} == 0 )); then
     info "node list has no active entries"
@@ -124,16 +134,33 @@ else
     # has no .git to read a remote from, but it always carries a pyproject.
     # Compared case-insensitively, which is what the id-vs-repo-name
     # difference usually amounts to.
+    #
+    # A URL entry also matches by the URL itself: the node's git remote, or
+    # the Repository its pyproject declares. The registry id and the repo
+    # name can share nothing at all (ComfyUI-Continuity installs from the
+    # registry as 'continuity'), and without this such an entry read as
+    # missing on every start.
+    node_url_norm() { local u="${1,,}"; u="${u%/}"; echo "${u%.git}"; }
     node_present() {
-      local want="$1" d base pname
+      local want="$1" d base pname url="" r
       case "$want" in
-        *://*|*.git) want="${want%.git}"; want="${want##*/}" ;;
+        *://*|*.git) url="$(node_url_norm "$want")"; want="${url##*/}" ;;
         *)           want="${want%%@*}" ;;
       esac
       for d in "$INSTALL_DIR"/custom_nodes/*/; do
         [[ -d "$d" ]] || continue
         d="${d%/}"; base="${d##*/}"
         [[ "${base,,}" == "${want,,}" ]] && return 0
+        if [[ -n "$url" ]]; then
+          # Only the node's own .git: without one, git would walk up and
+          # answer with the ComfyUI checkout's remote.
+          r=""
+          [[ -e "$d/.git" ]] && r="$(git -C "$d" config --get remote.origin.url 2>/dev/null || true)"
+          [[ -n "$r" && "$(node_url_norm "$r")" == "$url" ]] && return 0
+          r="$(sed -n 's/^[[:space:]]*[Rr]epository[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' \
+                 "$d/pyproject.toml" 2>/dev/null | head -1)"
+          [[ -n "$r" && "$(node_url_norm "$r")" == "$url" ]] && return 0
+        fi
         [[ -f "$d/pyproject.toml" ]] || continue
         pname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' \
                    "$d/pyproject.toml" | head -1)"
