@@ -32,7 +32,7 @@ What the fork adds:
 | Image | One `runtime` image | Same, plus an optional `cluster` stage: dgx-monarch at its newest release tag, its xfuser compat wheel, `openssh-client`. Built only when `spark-cluster.toml` exists. It sits on top of `runtime`, so bumping dgx-monarch rebuilds one thin layer in seconds. |
 | Container roles | ComfyUI only | `SPARK_ROLE=driver` (ComfyUI, the default) or `worker` (a dgx-monarch worker loop). `SPARK_MONARCH=1` loads the dgx-monarch node pack from the image, not from your `custom_nodes`. |
 | Networking | Bridge network, `-p PORT:8188` | Unchanged stand-alone. Cluster mode uses `--network host --pid host`, the RDMA devices and an unlimited memlock limit, because Monarch and NCCL need the fabric and dgx-monarch's probes read the host's `/proc`. |
-| Default nodes | — | [Continuity](https://github.com/roadmaus/ComfyUI-Continuity) is installed on every start when missing, and can be updated from ComfyUI Manager. See [Bundled by default: Continuity](#bundled-by-default-continuity). |
+| Default nodes | — | [Continuity](https://github.com/roadmaus/ComfyUI-Continuity) is installed on every start when missing, and can be updated from ComfyUI Manager. See [Bundled by default: Continuity](#bundled-by-default-continuity). In cluster mode its H3 renders sample across the Sparks ([Continuity on the cluster](#continuity-on-the-cluster)). |
 | Commands | — | `cluster init \| worker \| push \| status \| dgxm`, see [Clustering](#clustering-dgx-monarch). |
 | Upgrades | `update` / `--rollback` / `--keep` for ComfyUI | The same commands also move and snapshot dgx-monarch (`org.spark-comfyui.monarch-sha` label). `cluster push` syncs the result to every Spark. |
 | Several installs per box | One per Spark (fixed names, port 8188) | UI on port **8182** by default, so it never lands on a stock install's 8188. A per-folder `spark-comfyui.env` sets the container, image and cache volume names (and the port), and `run`/`service` refuse a port someone else holds. See [Running two installs on one Spark](#running-two-installs-on-one-spark). |
@@ -623,6 +623,31 @@ mv spark-cluster.toml spark-cluster.toml.off  # on A and B; stand-alone again fr
 
 The cluster image still runs stand-alone. `update` rebuilds the plain one.
 
+### Continuity on the cluster
+
+[Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s MiniMax H3 renders sample across the Sparks in cluster mode. A Continuity workflow is one Creator node that builds its own graph. The cluster image carries a small overlay, `spark-continuity-monarch` next to dgx-monarch, that gives Continuity's H3 family a dgx-monarch sampling backend:
+- **What moves:** the transformer loads on every worker, and the sampling runs across them. dgx-monarch picks Ulysses ×2 on two Sparks.
+- **What stays on the driver:** the prompt encode, the VAE decode, the seams and the save.
+- **Continuity itself is untouched.** It stays roadmaus' pack and keeps updating from ComfyUI-Manager. If a Continuity update moves the internals the overlay hooks, the overlay switches itself off with one log line, and renders go back to one card.
+
+**Using it:**
+- **Automatic.** In cluster mode, every Continuity H3 video render samples on the cluster unless its weights pick Raylight. Stills stay on the driver's card.
+- **Opting out:** `SPARK_CONTINUITY_MONARCH=0` (in `spark-comfyui.env`) keeps Continuity renders on one card for the whole deployment.
+- **The default workflow:** **Workflow → Browse Templates → spark-continuity-monarch → "Continuity - MiniMax H3 on the DGX cluster"** is a clean Creator node already set up for the cluster.
+- **Status:** `curl http://<driver>:8182/spark/continuity-monarch` shows whether the backend is installed and active.
+
+**The first render of a model and LoRA combination** runs dgx-monarch's identity gate. It makes 2 short proof renders that must come out bit-identical on every rank, which takes about 80 s once. Later renders skip it. Your first render's log shows `identity gate PASS`, then `rank 0/spark-ams01` and `rank 1/spark-ams02` sampling the same latent.
+
+**What the cluster can't carry is refused by name before anything is queued,** the same way Continuity's own Raylight backend refuses it:
+- The face, refine (two-pass upscale) and re-detail passes. They sample against a model on the driver, and the cluster has none there.
+- The turbo lead-in.
+- Blended sound seams and ControlNet guides.
+- The model-patch accelerators: step cache, Spectrum, chunked FFN, fp16 accumulation.
+- Device pins and a two-checkpoint route.
+- A sigma shift off the checkpoint's own (12/3).
+
+The error names the switch to turn off. LoRAs are merged by dgx-monarch's LoRA loader rather than Continuity's own H3 stack. A LoRA with its audio dial turned down is refused.
+
 ### Day to day
 
 | Task | Command |
@@ -668,6 +693,7 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 | `WORKER_NAME` | `<CONTAINER_NAME>-worker` | This Spark's worker container. |
 | `SPARK_WORKER_ADDRESS` | from the config | This Spark's worker bind, when `hostname -I` does not list its fabric IP. |
 | `SPARK_REMOTE_SCRIPT` | this path | Where `spark-comfyui.sh` lives on the other Sparks. |
+| `SPARK_CONTINUITY_MONARCH` | `1` | `0` keeps Continuity's H3 renders on the driver's card in cluster mode. |
 
 ## Troubleshooting
 
