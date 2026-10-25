@@ -688,6 +688,8 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 
 **Faster local passes.** While the cluster samples a render that has a face, refine or re-detail pass, the driver asks the kernel to read that pass's checkpoint and the SAM3 detector ahead. The local pass then starts from memory instead of a cold 20 GB read. This only uses the page cache, which the kernel can drop again under pressure.
 
+**Capacity.** dgx-monarch checks memory before it dispatches a render, and refuses one that won't fit (`[dgxm:C …]`). When it refuses a Continuity render, the overlay unloads the driver ComfyUI's idle models (text encoder, VAEs) and retries once. Nothing has been dispatched at that point, so the retry is safe. Those models are idle while the cluster samples, and they reload from the page cache for the decode and any local pass. That unload is about 15 GB on the driver Spark, where rank 0 shares memory with ComfyUI.
+
 A local pass loads a second copy of the transformer on the driver Spark, about 21 GB for H3 int8, next to the cluster's own copy on that Spark's worker. Leave that much memory free there: an idle stock ComfyUI on the same Spark that's holding a model can use it up. LoRAs on the cluster are merged by dgx-monarch's LoRA loader rather than Continuity's own H3 stack.
 
 ### Day to day
@@ -727,6 +729,8 @@ A local pass loads a second copy of the transformer on the driver Spark, about 2
 - **`dgxm doctor`: "mesh health: a local driver gave no readable answer"** with a stock ComfyUI on the same Spark: dgx-monarch asks every local ComfyUI for its mesh state, and the stock one answers 404. Harmless.
 - **Probe rows come back empty** (`env: no output`, unobserved listener generation): check that the host shim at `~/.local/share/<CONTAINER_NAME>/python` is current. Re-run `cluster worker --restart`. The shim forwards stdin only when a probe redirects it.
 - **The identity gate runs again**: it runs once per checkpoint and LoRA combination, and again after an image change.
+- **`[dgxm:C guard=loader_footprint_preflight …]` at the loader**: the driver Spark can't hold a stock host copy of the weights while it places them. Click **Load with slab residency** on the model's card in the DGX Monarch panel, or set `DGXM_ALLOW_SLAB_RESCUE=1`. Slab residency maps the weights from the file instead of copying them.
+- **`[dgxm:C guard=activation_footprint_preflight …]`**: the packed sequence is too big for the free memory on some rank. The refusal itemises it: video, audio, text and **reference** rows. Every reference block stays in the sequence for every step, so a reference video at `max` size is often the biggest item. For Continuity renders the overlay frees the driver's idle models and retries once first. If it still doesn't fit, use smaller or shorter references, a smaller canvas or a shorter clip, or free memory on the Sparks: a stock install sharing the box is the usual holder.
 - **Memory**: each Spark holds the cluster's copy of the transformer. The driver Spark also holds the local passes' copy and the text encoder. An idle stock ComfyUI that keeps its last model loaded can take tens of GB; free it in that UI, or restart it, before a long render.
 
 ### Settings
