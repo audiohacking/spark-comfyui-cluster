@@ -295,6 +295,11 @@ cp "$OLD/../comfyui-nodes.list" . 2>/dev/null   # the same registry node list, i
 echo "DATA_DIR=$HOME/Documents/ComfyUI/spark-comfyui/data" >> spark-comfyui.env
 ```
 
+A `DATA_DIR` you set is treated as existing content that this checkout doesn't own:
+- **It must already exist.** Every command checks first and stops if it's missing. It is never created: a typo or an unmounted disk can't quietly turn into an empty data folder.
+- **Nothing is created inside it.** If an entry such as `user` or `custom_nodes` is missing, the command stops and names it instead of making an empty one. `extra_model_paths.yaml` is mounted only if the file exists.
+- **The default `data/`** (no `DATA_DIR` set) still creates its skeleton on first use, as before.
+
 That works, but both installs then run the same custom node code and write the same settings. Every start reconciles `comfyui-nodes.list` into that shared `custom_nodes`, and a node updated through Manager in one install changes under the other while it runs. Use it when the two don't run at the same time, or start them one at a time. A node's Python requirements are not shared: each container installs them into its own image environment on start.
 
 **Things to know**
