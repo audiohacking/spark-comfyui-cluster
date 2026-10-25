@@ -43,7 +43,13 @@ git clone https://github.com/audiohacking/spark-comfyui.git
 cd spark-comfyui
 ```
 
-Then follow the [Quick start](#quick-start). `update` self-updates from the branch you cloned, so this fork's updates come from this fork.
+Until clustering is merged into `main`, it lives on the `cluster-monarch` branch:
+
+```bash
+git clone -b cluster-monarch https://github.com/audiohacking/spark-comfyui.git spark-comfyui-cluster
+```
+
+Then follow the [Quick start](#quick-start), or [Quick test: one Spark, then two](#quick-test-one-spark-then-two). `update` self-updates from the branch you cloned, so this fork's updates come from this fork.
 
 ### Next to an existing upstream install
 
@@ -418,6 +424,112 @@ This finds the `[[hosts]]` row whose IP is local, starts the worker container, a
 ```
 
 dgx-monarch's example workflows appear under **Workflow → Browse Templates**. For MiniMax H3, start from `dgx-monarch-minimax-h3-t2va` (or `-mp4`, `-guide`). They replace the stock loader and sampler with `DGXMonarchUNETLoader` and `DGXMonarchKSampler`, behind a `DGXMonarchInit` node that attaches the fleet. Upstream's `example_workflows/artifacts.toml` lists the model files they expect. The first render attaches every worker and loads the model on each rank, so it takes longer than the ones after it.
+
+### Quick test: one Spark, then two
+
+A first run of the fork on two Sparks, A (the driver) and B, either of which may also have a stock install running. Phase 1 proves each Spark on its own. Phase 2 clusters them. Commands run in the checkout directory unless a step says otherwise.
+
+#### Phase 1: each Spark on its own
+
+On **both** Sparks:
+
+```bash
+# 1. Clone at the SAME path on both ('cluster push' restarts B's worker by that path)
+git clone -b cluster-monarch https://github.com/audiohacking/spark-comfyui.git ~/spark-comfyui-cluster
+cd ~/spark-comfyui-cluster
+
+# 2. Only if a stock spark-comfyui runs on this Spark: own names and port
+cat > spark-comfyui.env <<'EOF'
+CONTAINER_NAME=spark-comfyui-cluster
+CONTAINER_IMAGE=spark-comfyui-cluster
+PORT=8189
+EOF
+
+# 3. Optional: reuse models that are already on this Spark instead of copying them
+echo "models = /path/to/existing/data/models" > spark-mounts.conf
+
+# 4. Build (stand-alone: no spark-cluster.toml yet) and check
+./spark-comfyui.sh install
+./spark-comfyui.sh doctor            # every line PASS
+./spark-comfyui.sh status            # 'instance:' shows the names and port above
+
+# 5. Run, open http://<spark-ip>:8189 (or :8188 without the env file), queue a small workflow
+./spark-comfyui.sh run
+```
+
+Pass criteria: `doctor` is green, the UI loads, and a generation finishes on each Spark. The stock container, if there is one, is still `Up` in `docker ps`. If you plan to time the cluster later, also run the MiniMax H3 workflow you will cluster here, on A alone, and note the time. Stop with Ctrl-C.
+
+> [!NOTE]
+> `install` and `update` trim the BuildKit cache, which a stock install on the same Spark shares, to `CACHE_MAX_GB` (40 GB). That cache only makes rebuilds faster. It never affects a running container or an image.
+
+#### Phase 2: clustered
+
+**Pre-flight**, from A. Each line must succeed before going on (`192.168.100.11` is A's fabric IP and `192.168.100.12` is B's; use yours):
+
+```bash
+ip -br addr | grep 192.168.100.        # A's fabric IP is up
+ping -c2 192.168.100.12                 # B answers over the fabric
+ssh 192.168.100.12 docker info >/dev/null && echo ok   # passwordless ssh, docker without sudo on B
+ssh 192.168.100.12 test -x ~/spark-comfyui-cluster/spark-comfyui.sh && echo ok   # same path on B
+ss -ltn | grep -E ':(26600|29777|8189)\b' || echo free  # ports free on A; run it on B too
+```
+
+If your user name differs on B, add `ssh_user = "name"` to B's `[[hosts]]` block in step 2.
+
+**On A, the driver:**
+
+```bash
+# 1. config + cluster key
+./spark-comfyui.sh cluster init
+ssh-copy-id -i ~/.ssh/spark-cluster/id_ed25519.pub 192.168.100.11   # A itself
+ssh-copy-id -i ~/.ssh/spark-cluster/id_ed25519.pub 192.168.100.12   # B
+ssh-keyscan -H 192.168.100.11 192.168.100.12 >> ~/.ssh/spark-cluster/known_hosts
+
+# 2. edit spark-cluster.toml: the 192.0.2.x placeholders -> 192.168.100.11 (first) and .12,
+#    fabric_profile = "dgx-spark-pair" for one direct cable, or "generic-roce" + NIC names
+#    for a switch (see the example above; 'ibdev2netdev' lists the NICs)
+${EDITOR:-nano} spark-cluster.toml
+
+# 3. the same file on B
+scp spark-cluster.toml 192.168.100.12:~/spark-comfyui-cluster/
+
+# 4. build the cluster image, send it to B (this also starts B's worker), start A's worker
+./spark-comfyui.sh update
+./spark-comfyui.sh cluster push
+./spark-comfyui.sh cluster worker
+```
+
+**Check before the first render:**
+
+```bash
+./spark-comfyui.sh cluster status       # both hosts: worker healthy, SAME image ID and monarch commit, no WARN
+./spark-comfyui.sh cluster dgxm doctor  # dgx-monarch's own checks, all green
+ssh -i ~/.ssh/spark-cluster/id_ed25519 192.168.100.12 '~/.local/share/spark-comfyui/python -c "print(1)"'   # prints 1
+```
+
+B's worker can stay `starting` for a few minutes on its first start (node requirements and GPU checks). `ssh 192.168.100.12 docker logs -f spark-comfyui-cluster-worker` shows its progress.
+
+**Render:**
+
+```bash
+./spark-comfyui.sh run                  # UI on http://<A-ip>:8189
+```
+
+1. Open **Workflow → Browse Templates** and load `dgx-monarch-minimax-h3-t2va`. Point its loader at your MiniMax H3 model, and keep the frame count small for the first run.
+2. Queue it. The first run attaches both workers and loads the model on each rank, so it is slow.
+3. In a second terminal on A, run `./spark-comfyui.sh cluster dgxm top`. Both hosts should show GPU load during sampling.
+4. Queue it again at the size you timed in phase 1, and compare.
+
+When something fails, check the [cluster troubleshooting](#cluster-troubleshooting) list first. Note the step and the `cluster status` / `cluster dgxm doctor` output for an issue.
+
+**Back to stand-alone after testing:**
+
+```bash
+./spark-comfyui.sh cluster worker --disable   # on A, and on B
+mv spark-cluster.toml spark-cluster.toml.off  # on A and B; stand-alone again from the next command
+```
+
+The cluster image still runs stand-alone. `update` rebuilds the plain one.
 
 ### Day to day
 
