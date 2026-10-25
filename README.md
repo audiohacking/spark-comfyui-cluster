@@ -631,22 +631,26 @@ The cluster image still runs stand-alone. `update` rebuilds the plain one.
 - **Continuity itself is untouched.** It stays roadmaus' pack and keeps updating from ComfyUI-Manager. If a Continuity update moves the internals the overlay hooks, the overlay switches itself off with one log line, and renders go back to one card.
 
 **Using it:**
-- **Automatic.** In cluster mode, every Continuity H3 video render samples on the cluster unless its weights pick Raylight. Stills stay on the driver's card.
+- **Automatic.** In cluster mode, every Continuity H3 video render uses the cluster unless its weights pick Raylight. Stills stay on the driver's card.
 - **Opting out:** `SPARK_CONTINUITY_MONARCH=0` (in `spark-comfyui.env`) keeps Continuity renders on one card for the whole deployment.
 - **The default workflow:** **Workflow → Browse Templates → spark-continuity-monarch → "Continuity - MiniMax H3 on the DGX cluster"** is a clean Creator node already set up for the cluster.
 - **Status:** `curl http://<driver>:8182/spark/continuity-monarch` shows whether the backend is installed and active.
 
 **The first render of a model and LoRA combination** runs dgx-monarch's identity gate. It makes 2 short proof renders that must come out bit-identical on every rank, which takes about 80 s once. Later renders skip it. Your first render's log shows `identity gate PASS`, then `rank 0/spark-ams01` and `rank 1/spark-ams02` sampling the same latent.
 
-**What the cluster can't carry is refused by name before anything is queued,** the same way Continuity's own Raylight backend refuses it:
-- The face, refine (two-pass upscale) and re-detail passes. They sample against a model on the driver, and the cluster has none there.
-- The turbo lead-in.
-- Blended sound seams and ControlNet guides.
-- The model-patch accelerators: step cache, Spectrum, chunked FFN, fp16 accumulation.
-- Device pins and a two-checkpoint route.
-- A sigma shift off the checkpoint's own (12/3).
+**Nothing is refused: the cluster takes what it can, and the rest runs on the driver Spark.**
+- **Main pass:** each generation's main pass samples on the cluster when it can.
+- **Main pass, kept local:** it samples locally, exactly as Continuity does on one card, when it needs something the mesh can't carry:
+  - a turbo lead-in
+  - a sigma shift off the checkpoint's own (12/3)
+  - a sound seam or a ControlNet guide
+  - a model-patch accelerator (step cache, Spectrum, chunked FFN, fp16 accumulation)
+  - a LoRA with its audio dial turned down
+  - a second checkpoint or LoRA stack in the same strip, since the mesh holds one
+- **Always local:** the face, refine (two-pass upscale), re-detail and seam-restore passes sample on the driver Spark after the cluster has done the main pass. They use Continuity's own LoRA stack and patches.
+- **The log says which:** `comfyui_8182.log` names every local decision and its reason, for example `Continuity: the face pass samples on this Spark`.
 
-The error names the switch to turn off. LoRAs are merged by dgx-monarch's LoRA loader rather than Continuity's own H3 stack. A LoRA with its audio dial turned down is refused.
+A local pass loads a second copy of the transformer on the driver Spark, about 21 GB for H3 int8, next to the cluster's own copy on that Spark's worker. Leave that much memory free there: an idle stock ComfyUI on the same Spark that's holding a model can use it up. LoRAs on the cluster are merged by dgx-monarch's LoRA loader rather than Continuity's own H3 stack.
 
 ### Day to day
 
