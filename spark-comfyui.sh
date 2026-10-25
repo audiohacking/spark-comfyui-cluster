@@ -1658,6 +1658,10 @@ seed_mounts_conf() {
 #
 # Per-entry overrides (keys match the content set exactly):
 # models = /mnt/fast-ssd/models
+#
+# Another install already has the models? Share them instead of downloading
+# again (README: 'Sharing an existing data folder'):
+# models = ~/spark-comfyui/data/models
 # output = /mnt/nas/comfyui-output
 # user = data/user
 # input = data/input

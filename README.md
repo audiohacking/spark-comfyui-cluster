@@ -66,7 +66,7 @@ EOF
 
 Two things stay shared on purpose. One is the BuildKit cache: both installs reuse the torch and SageAttention layers, and `update`/`prune` in either one trim it to `CACHE_MAX_GB`. The other is `tune`, which is host-wide. Only one dgx-monarch worker can run per Spark.
 
-To reuse the stock models without copying them, add a `models` line to `spark-mounts.conf` (see [Mounts](#mounts)).
+**Don't download your models again.** Point the new install at the existing `data/` before its first `run`. See [Sharing an existing data folder](#sharing-an-existing-data-folder).
 
 ### Following upstream
 
@@ -240,6 +240,62 @@ For several setups, keep one file each and pick one per invocation with `--mount
 ```
 
 The flag works with every command and must name a file that exists, so a typo fails loudly instead of quietly mounting the defaults. `MOUNTS_CONF=PATH` does the same thing as an environment variable. Use it on `backup` and `restore` too so they act on that setup. To run two setups at once, give each its own `CONTAINER_NAME`, `CONTAINER_IMAGE` and `PORT` (see [Running two installs on one Spark](#running-two-installs-on-one-spark)).
+
+### Sharing an existing data folder
+
+An existing install's content lives in its own `data/`: `models`, `custom_nodes`, `user` (settings and saved workflows), `input`, `output`, and optionally `extra_model_paths.yaml`. A second install on the same Spark doesn't need copies of any of it. Map what you want to share in the new checkout's `spark-mounts.conf`, **before its first `run`**. Otherwise the new install starts with an empty `data/`, and anything you queue downloads models into it again.
+
+Models are the part that matters: hundreds of GB that you never want twice. Below, `OLD` is the existing install's data folder, for example `~/Documents/ComfyUI/spark-comfyui/data`.
+
+**Recommended: share models, give each install its own nodes and settings.**
+
+```ini
+# spark-mounts.conf in the NEW checkout
+models = ~/Documents/ComfyUI/spark-comfyui/data/models
+# also share the yaml if the old install has one (it points at extra model locations)
+# extra_model_paths.yaml = ~/Documents/ComfyUI/spark-comfyui/data/extra_model_paths.yaml
+# shared inputs/outputs are optional and harmless:
+# input  = ~/Documents/ComfyUI/spark-comfyui/data/input
+# output = ~/Documents/ComfyUI/spark-comfyui/data/output
+```
+
+Then seed the new install's nodes and workflows once from the old one. It's a copy, so updating a node in one install never changes the other:
+
+```bash
+OLD=~/Documents/ComfyUI/spark-comfyui/data
+mkdir -p data
+cp -a "$OLD/custom_nodes" "$OLD/user" data/
+cp "$OLD/../comfyui-nodes.list" . 2>/dev/null   # the same registry node list, if you use one
+./spark-comfyui.sh status                         # the mounts table must show models -> $OLD/models
+```
+
+`status` prints the resolved table on every run. Check that `models` points at the old folder before you start. Model files arrive through the mount, so nothing is copied and both installs see a model downloaded by either one.
+
+**Alternative: share everything.** Set `DATA_DIR` in `spark-comfyui.env` and the new install uses the old `data/` as its own:
+
+```bash
+echo "DATA_DIR=$HOME/Documents/ComfyUI/spark-comfyui/data" >> spark-comfyui.env
+```
+
+That works, but both installs then run the same custom node code and write the same settings. Every start reconciles `comfyui-nodes.list` into that shared `custom_nodes`, and a node updated through Manager in one install changes under the other while it runs. Use it when the two don't run at the same time, or start them one at a time. A node's Python requirements are not shared: each container installs them into its own image environment on start.
+
+**Things to know**
+
+- **Ownership:** both installs run as whoever launches them, so use the same Linux user for both. `doctor` names any directory owned by another uid.
+- **Configured paths must exist:** a configured path's parent must exist, so a typo or an unmounted share fails loudly instead of mounting an empty folder over your models.
+- **Data commands:**
+  - `reset` and `prune` never touch content, shared or not.
+  - `restore` writes into whatever is mapped, including a shared folder.
+  - `backup` manifests models and never archives them, so a shared `models` doesn't make backups bigger.
+- **Clustering:** every Spark needs the same models at the same relative paths. Each Spark has its own disk, so copy just the files a workflow needs once over the fabric. Don't download them again:
+
+  ```bash
+  # from A: send A's diffusion models to B over the fabric, resumable
+  rsync -a --partial --info=progress2 ~/Documents/ComfyUI/spark-comfyui/data/models/diffusion_models/ \
+        192.168.100.12:~/Documents/ComfyUI/spark-comfyui/data/models/diffusion_models/
+  ```
+
+  A network share mapped with `models = /mnt/share/models` on every Spark works too, but each rank then loads the weights over the network.
 
 ## Patch list (optional)
 
@@ -445,8 +501,9 @@ CONTAINER_IMAGE=spark-comfyui-cluster
 PORT=8189
 EOF
 
-# 3. Optional: reuse models that are already on this Spark instead of copying them
-echo "models = /path/to/existing/data/models" > spark-mounts.conf
+# 3. Already have models on this Spark (a stock install's data/)? Share them, don't
+#    download again, BEFORE the first run. Details: "Sharing an existing data folder"
+echo "models = ~/Documents/ComfyUI/spark-comfyui/data/models" > spark-mounts.conf
 
 # 4. Build (stand-alone: no spark-cluster.toml yet) and check
 ./spark-comfyui.sh install
