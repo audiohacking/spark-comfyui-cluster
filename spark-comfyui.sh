@@ -3224,20 +3224,26 @@ ssh_key = "~/.ssh/id_ed25519"
 # be the Spark that runs ComfyUI. 'name' is what ssh dials (use the fabric IP
 # so the driver can tell which host is itself); every host declares the same
 # gpus count. Workers on all of them, including the driver's own Spark.
+# ssh_user is required in container mode: the driver container's ssh client
+# runs as 'comfy', so without it every probe would log in as comfy. Seeded with
+# the account that ran 'cluster init'; change a row whose Spark differs.
 [[hosts]]
 name = "192.0.2.11"
 address = "tcp://192.0.2.11:26600"
 gpus = 1
+ssh_user = "$(id -un)"
 
 [[hosts]]
 name = "192.0.2.12"
 address = "tcp://192.0.2.12:26600"
 gpus = 1
+ssh_user = "$(id -un)"
 
 # [[hosts]]
 # name = "192.0.2.13"
 # address = "tcp://192.0.2.13:26600"
 # gpus = 1
+# ssh_user = "$(id -un)"
 
 # generic-roce sets only NCCL_IB_GID_INDEX and NCCL_DEBUG. Name your NICs
 # (check with: ibdev2netdev, ip -br link):

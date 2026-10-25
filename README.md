@@ -29,7 +29,7 @@ What the fork adds:
 
 | Area | Upstream | This fork |
 |---|---|---|
-| Image | One `runtime` image | Same, plus an optional `cluster` stage: dgx-monarch at its newest release tag, its xfuser compat wheel, `openssh-client`. Built only when `spark-cluster.toml` exists. It sits on top of `runtime`, so bumping dgx-monarch rebuilds one thin layer in seconds. |
+| Image | One `runtime` image | Same, plus an optional `cluster` stage. It adds dgx-monarch at its newest release tag (with one small patch that streams preview latents), its xfuser compat wheel, `openssh-client` and `rsync`, and the Continuity overlay. Built only when `spark-cluster.toml` exists. It sits on top of `runtime`, so bumping dgx-monarch rebuilds one thin layer in seconds. |
 | Container roles | ComfyUI only | `SPARK_ROLE=driver` (ComfyUI, the default) or `worker` (a dgx-monarch worker loop). `SPARK_MONARCH=1` loads the dgx-monarch node pack from the image, not from your `custom_nodes`. |
 | Networking | Bridge network, `-p PORT:8188` | Unchanged stand-alone. Cluster mode uses `--network host --pid host`, the RDMA devices and an unlimited memlock limit, because Monarch and NCCL need the fabric and dgx-monarch's probes read the host's `/proc`. |
 | Default nodes | — | [Continuity](https://github.com/roadmaus/ComfyUI-Continuity) is installed on every start when missing, and can be updated from ComfyUI Manager. See [Bundled by default: Continuity](#bundled-by-default-continuity). In cluster mode its H3 renders sample across the Sparks ([Continuity on the cluster](#continuity-on-the-cluster)). |
@@ -59,7 +59,11 @@ EOF
 ./spark-comfyui.sh status    # "instance:" shows the names in effect
 ```
 
-Two things stay shared on purpose. One is the BuildKit cache: both installs reuse the torch and SageAttention layers, and `update`/`prune` in either one trim it to `CACHE_MAX_GB`. The other is `tune`, which is host-wide. Only one dgx-monarch worker can run per Spark.
+Two things stay shared on purpose:
+- **The BuildKit cache.** Both installs reuse the torch and SageAttention layers. While the other install's images exist, this fork leaves trimming the cache to that install.
+- **`tune`.** It's host-wide, and `tune --revert` refuses while another install exists.
+
+Only one dgx-monarch worker can run per Spark.
 
 **Don't download your models again.** Point the new install at the existing `data/` before its first `run`. See [Sharing an existing data folder](#sharing-an-existing-data-folder).
 
@@ -72,7 +76,11 @@ git remote add upstream https://github.com/bjarkebolding/spark-comfyui.git
 git fetch upstream && git merge upstream/main
 ```
 
-Fork-only code lives in clearly marked places: the `cluster` Dockerfile stage, the role block in `container/entrypoint.sh`, `container/worker-health.sh`, `container/monarch-paths.yaml`, `lib/cluster_read.py`, and the `cluster`/`_cluster_*` functions in `spark-comfyui.sh`. Merges therefore rarely conflict.
+Fork-only code lives in clearly marked places, so merges rarely conflict:
+- **Dockerfile:** the `cluster` stage.
+- **`container/`:** the role block in `entrypoint.sh`, `worker-health.sh`, `monarch-paths.yaml`, `monarch-preview-x0.patch`, `default-nodes.list` and the `spark-continuity-monarch/` overlay.
+- **`lib/cluster_read.py`.**
+- **`spark-comfyui.sh`:** the `cluster`/`_cluster_*` functions, plus the per-instance pieces (the `spark-comfyui.env` loader, instance labels and names, and the precious-`DATA_DIR` guard).
 
 ## Contents
 
@@ -305,6 +313,7 @@ That works, but both installs then run the same custom node code and write the s
 **Things to know**
 
 - **Ownership:** both installs run as whoever launches them, so use the same Linux user for both. `doctor` names any directory owned by another uid.
+- **Sharing `user/`** (with `DATA_DIR`) also shares ComfyUI's `comfyui.db`. While the other install runs, startup prints `WARNING … Another ComfyUI is already using this install's asset database`. The assets system is off by default, so neither install uses that database, and both start normally.
 - **Configured paths must exist:** a configured path's parent must exist, so a typo or an unmounted share fails loudly instead of mounting an empty folder over your models.
 - **Data commands:**
   - `reset` and `prune` never touch content, shared or not.
@@ -402,8 +411,13 @@ It finds each model under `models/`, records the destination, size and sha256, a
 
 **It is off until you create `spark-cluster.toml`.** Without that file every command behaves as above. With it, `install`/`update` build a `cluster` image (the normal image plus a thin dgx-monarch layer), and the containers run on the host network so Monarch and NCCL can reach the fabric. `SPARK_CLUSTER=0` forces stand-alone even with the file present.
 
-> [!IMPORTANT]
-> **Status:** the cluster image, the worker container and dgx-monarch's per-host probe are verified on a single Spark. A multi-Spark attach and NCCL over RoCE with all capabilities dropped have not been run yet. If NCCL fails to register memory, that points at the missing `IPC_LOCK` capability; please open an issue.
+> [!NOTE]
+> **Status:** verified on two Sparks over a RoCE fabric, with each Spark also running a stock install.
+> - **Bring-up:** `dgxm doctor` passes 44 checks with 0 failures. The mesh attaches both ranks with NCCL over RoCE and every capability dropped.
+> - **Correctness:** the identity gate's proof renders are bit-identical across ranks.
+> - **Renders:** dgx-monarch's own H3 templates and Continuity workflows render across both Sparks, with face passes and live previews.
+>
+> Larger fleets use the same code path but have not been run here.
 
 ### Roles
 
@@ -429,7 +443,17 @@ On every Spark:
 ./spark-comfyui.sh cluster init
 ```
 
-This writes `spark-cluster.toml` (gitignored, never overwritten) and creates a dedicated key in `~/.ssh/spark-cluster`. The driver *container* uses that key for dgx-monarch's per-host probes. It isn't your `~/.ssh`, because custom nodes run in that container too. A re-run prints the public key again.
+This writes `spark-cluster.toml` (gitignored, never overwritten, mode 0600) and creates a dedicated key in `~/.ssh/<CONTAINER_NAME>`, for example `~/.ssh/spark-comfyui-cluster`. The driver *container* uses that key for dgx-monarch's per-host probes. It mounts that folder rather than your `~/.ssh`, because custom nodes run in that container too. A re-run prints the public key again.
+
+**Already have a key that every Spark accepts?** You can reuse it instead of authorizing a new one. Copy it into that folder, keep its name, and point `ssh_key` at it:
+
+```bash
+mkdir -m 700 -p ~/.ssh/spark-comfyui-cluster
+cp ~/.ssh/id_ed25519_shared ~/.ssh/spark-comfyui-cluster/   # your key's name
+# spark-cluster.toml: ssh_key = "~/.ssh/id_ed25519_shared"   (the container's ~/.ssh is that folder)
+```
+
+The trade-off: custom nodes in the driver container can read whichever key sits there.
 
 **2. Authorize ssh.** It takes two kinds of access:
 
@@ -444,7 +468,7 @@ ssh-keyscan -H 192.168.100.11 192.168.100.12 192.168.100.13 >> ~/.ssh/spark-comf
 ssh 192.168.100.12 true
 ```
 
-**3. Edit `spark-cluster.toml`.** Replace every `192.0.2.x` placeholder with the fabric IPs. Use one `[[hosts]]` block per Spark, the driver first, and the same `gpus = 1` everywhere. Name your NICs under `[fabric.generic-roce]`. Leave `python`, `auto_heal = false` and `comfy_dir` as seeded: container mode depends on both, and `cluster status` warns if they change. A three-Spark switch looks like this:
+**3. Edit `spark-cluster.toml`.** Replace every `192.0.2.x` placeholder with the fabric IPs. Use one `[[hosts]]` block per Spark, the driver first, and the same `gpus = 1` everywhere. Name your NICs under `[fabric.generic-roce]`. Leave `python`, `auto_heal = false` and `comfy_dir` as seeded, since container mode depends on all three; `cluster status` warns if they change. Keep `ssh_user` on every host: the driver container's ssh client runs as `comfy`, so without it the probes log in as `comfy`. A three-Spark switch looks like this:
 
 ```toml
 [cluster]
@@ -462,16 +486,19 @@ ssh_key            = "~/.ssh/id_ed25519"
 name = "192.168.100.11"
 address = "tcp://192.168.100.11:26600"
 gpus = 1
+ssh_user = "you"
 
 [[hosts]]
 name = "192.168.100.12"
 address = "tcp://192.168.100.12:26600"
 gpus = 1
+ssh_user = "you"
 
 [[hosts]]
 name = "192.168.100.13"
 address = "tcp://192.168.100.13:26600"
 gpus = 1
+ssh_user = "you"
 
 [fabric.generic-roce]
 NCCL_SOCKET_IFNAME = "enp1s0f0np0"
@@ -486,7 +513,7 @@ Use names that are fabric IPs: that's how each Spark finds its own row, so one f
 **4. Copy the file to every Spark**, next to `spark-comfyui.sh`:
 
 ```bash
-for h in 192.168.100.12 192.168.100.13; do scp spark-cluster.toml "$h":~/spark-comfyui/; done
+for h in 192.168.100.12 192.168.100.13; do scp -p spark-cluster.toml "$h":~/Documents/ComfyUI/spark-comfyui-cluster/; done   # same checkout path everywhere
 ```
 
 **5. Build on the driver, then push:**
@@ -514,7 +541,7 @@ This finds the `[[hosts]]` row whose IP is local, starts the worker container, a
 ./spark-comfyui.sh service               # or 'run'; UI on http://<driver-ip>:$PORT
 ```
 
-dgx-monarch's example workflows appear under **Workflow → Browse Templates**. For MiniMax H3, start from `dgx-monarch-minimax-h3-t2va` (or `-mp4`, `-guide`). They replace the stock loader and sampler with `DGXMonarchUNETLoader` and `DGXMonarchKSampler`, behind a `DGXMonarchInit` node that attaches the fleet. Upstream's `example_workflows/artifacts.toml` lists the model files they expect. The first render attaches every worker and loads the model on each rank, so it takes longer than the ones after it.
+dgx-monarch's example workflows appear under **Workflow → Browse Templates**. For MiniMax H3, start from `dgx-monarch-minimax-h3-t2va` (or `-mp4`, `-guide`). They replace the stock loader and sampler with `DGXMonarchUNETLoader` and `DGXMonarchKSampler`, behind a `DGXMonarchInit` node that attaches the fleet. Upstream's `example_workflows/artifacts.toml` lists the model files they expect. The first render attaches every worker and loads the model on each rank, so it takes longer than the ones after it. For Continuity there's nothing to change: see [Continuity on the cluster](#continuity-on-the-cluster).
 
 ### Quick test: one Spark, then two
 
@@ -539,6 +566,8 @@ EOF
 # 3. Already have models on this Spark (a stock install's data/)? Share them, don't
 #    download again, BEFORE the first run. Details: "Sharing an existing data folder"
 echo "models = ~/Documents/ComfyUI/spark-comfyui/data/models" > spark-mounts.conf
+#    ...or use that whole data folder, models, nodes and workflows (it must exist):
+#    echo "DATA_DIR=$HOME/Documents/ComfyUI/spark-comfyui/data" >> spark-comfyui.env
 
 # 4. Build (stand-alone: no spark-cluster.toml yet) and check
 ./spark-comfyui.sh install
@@ -549,7 +578,7 @@ echo "models = ~/Documents/ComfyUI/spark-comfyui/data/models" > spark-mounts.con
 ./spark-comfyui.sh run
 ```
 
-Pass criteria: `doctor` is green, the UI loads, and a generation finishes on each Spark. The stock container, if there is one, is still `Up` in `docker ps`. If you plan to time the cluster later, also run the MiniMax H3 workflow you will cluster here, on A alone, and note the time. Stop with Ctrl-C.
+Pass criteria: `doctor` is green, the UI loads, and a generation finishes on each Spark. If a `spark-cluster.toml` is already in the checkout, prefix the commands with `SPARK_CLUSTER=0` for this phase. The stock container, if there is one, is still `Up` in `docker ps`. If you plan to time the cluster later, also run the MiniMax H3 workflow you will cluster here, on A alone, and note the time. Stop with Ctrl-C.
 
 > [!NOTE]
 > The BuildKit cache belongs to docker, so a stock install on the same Spark shares it. While another install's images exist, this checkout's `install`, `update` and `prune` leave the cache alone and say so. The stock install's own `update` keeps trimming it. Set `CACHE_TRIM_SHARED=1` to trim from here anyway.
@@ -566,7 +595,7 @@ ssh 192.168.100.11 test -x ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfy
 ss -ltn | grep -E ':(26600|29777|8182)\b' || echo free  # ports free on A; run it on B too
 ```
 
-If your user name differs on B, add `ssh_user = "name"` to B's `[[hosts]]` block in step 2.
+`cluster init` seeds `ssh_user` with your account on every host. If your user name differs on B, change B's row in step 2. To reuse a key both Sparks already accept instead of the new one, see [step 1](#step-by-step).
 
 **On A, the driver:**
 
@@ -577,7 +606,8 @@ ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub 192.168.100.10   # A 
 ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub 192.168.100.11   # B
 ssh-keyscan -H 192.168.100.10 192.168.100.11 >> ~/.ssh/spark-comfyui-cluster/known_hosts
 
-# 2. edit spark-cluster.toml: the 192.0.2.x placeholders -> 192.168.100.10 (first) and .12,
+# 2. edit spark-cluster.toml: the 192.0.2.x placeholders -> 192.168.100.10 (first) and .11,
+#    ssh_user = your account on each Spark (seeded with yours),
 #    fabric_profile = "dgx-spark-pair" for one direct cable, or "generic-roce" + NIC names
 #    for a switch (see the example above; 'ibdev2netdev' lists the NICs)
 ${EDITOR:-nano} spark-cluster.toml
@@ -611,6 +641,7 @@ B's worker can stay `starting` for a few minutes on its first start (node requir
 2. Queue it. The first run attaches both workers and loads the model on each rank, so it is slow.
 3. In a second terminal on A, run `./spark-comfyui.sh cluster dgxm top`. Both hosts should show GPU load during sampling.
 4. Queue it again at the size you timed in phase 1, and compare.
+5. For Continuity, load **Browse Templates → spark-continuity-monarch → "Continuity - MiniMax H3 on the DGX cluster"**, or your own Continuity workflow, and queue it. The log names what ran on the cluster and what ran locally.
 
 When something fails, check the [cluster troubleshooting](#cluster-troubleshooting) list first. Note the step and the `cluster status` / `cluster dgxm doctor` output for an issue.
 
@@ -691,6 +722,12 @@ A local pass loads a second copy of the transformer on the driver Spark, about 2
 - **NCCL hangs or picks the wrong NIC**: set `NCCL_SOCKET_IFNAME` and `NCCL_IB_HCA` under `[fabric.generic-roce]`, then `cluster worker --restart` everywhere. Add `NCCL_DEBUG = "INFO"` there to see what NCCL chose.
 - **A worker stays `starting`**: `docker logs <CONTAINER_NAME>-worker`. The worker installs custom-node requirements and runs the same GPU checks as ComfyUI before it listens, so the first start takes a few minutes.
 - **`cluster status` prints WARN lines**: they flag a config that container mode can't work with (`python`, `auto_heal`, `transport_security`, `client_bind`). Fix them before attaching.
+- **`worker actor bring-up failed … exit_code: 1, stderr_tail: []`**: the actor process could not import Monarch. The cluster python path must be the image's exec wrapper, not a symlink, because python only finds its venv through the path it was started by. Rebuild with `update` and `cluster push`.
+- **Mesh `poisoned`** after a failed bring-up: dgx-monarch's remedy is a ComfyUI restart, `docker restart <CONTAINER_NAME>`. Resetting the mesh doesn't clear it.
+- **`dgxm doctor`: "mesh health: a local driver gave no readable answer"** with a stock ComfyUI on the same Spark: dgx-monarch asks every local ComfyUI for its mesh state, and the stock one answers 404. Harmless.
+- **Probe rows come back empty** (`env: no output`, unobserved listener generation): check that the host shim at `~/.local/share/<CONTAINER_NAME>/python` is current. Re-run `cluster worker --restart`. The shim forwards stdin only when a probe redirects it.
+- **The identity gate runs again**: it runs once per checkpoint and LoRA combination, and again after an image change.
+- **Memory**: each Spark holds the cluster's copy of the transformer. The driver Spark also holds the local passes' copy and the text encoder. An idle stock ComfyUI that keeps its last model loaded can take tens of GB; free it in that UI, or restart it, before a long render.
 
 ### Settings
 
