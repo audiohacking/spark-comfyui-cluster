@@ -474,17 +474,39 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
  && python /opt/monarch-nodes/dgx-monarch/tools/check_dependencies.py
 COPY --chown=comfy:0 --chmod=755 container/worker-health.sh /opt/spark/
 COPY --chown=comfy:0 container/monarch-paths.yaml /opt/spark/
+# Continuity on the cluster: an overlay pack beside dgx-monarch, so it loads
+# from the same extra custom-node root and only in the cluster image. It
+# gives Continuity's MiniMax H3 family a dgx-monarch sampling backend without
+# touching Continuity itself, which keeps updating from ComfyUI-Manager
+# (container/spark-continuity-monarch/continuity_monarch.py). Its
+# example_workflows/ is the default cluster workflow under Browse Templates.
+# Source files only: dgx-monarch's workers refuse bytecode imports.
+COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
+     container/spark-continuity-monarch/continuity_monarch.py \
+     /opt/monarch-nodes/spark-continuity-monarch/
+COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
+     /opt/monarch-nodes/spark-continuity-monarch/example_workflows/
 # The cluster.toml 'python' path. dgx-monarch runs its per-host probes with
 # that ONE path on every host, and the driver host runs them locally, i.e.
 # inside this container. On the other hosts the same path is a shim that
 # docker-execs into the worker container ('cluster worker' installs it).
 # The mountpoints are created here owned by comfy:0, so docker does not
 # create them as root at launch.
+#
+# An exec wrapper, not a symlink. Python finds its venv by the pyvenv.cfg
+# beside the path it was INVOKED by, so started through a symlink here it is
+# the bare system interpreter: no monarch, no torch. The workers start every
+# actor process through this path (monarch_launch.actor_bootstrap_command),
+# and through a symlink each one died on 'No module named monarch' with exit 1
+# and an empty stderr. exec keeps the argv dgx-monarch's process inspector
+# matches ('-m monarch._src.actor.bootstrap_main').
 RUN umask 002 \
  && mkdir -p /home/comfy/.local/share/spark-comfyui-cluster \
              /home/comfy/.local/state/dgx-monarch \
              /home/comfy/.config/dgx-monarch \
- && ln -s /opt/comfyui-env/bin/python /home/comfy/.local/share/spark-comfyui-cluster/python
+ && printf '#!/bin/sh\nexec /opt/comfyui-env/bin/python "$@"\n' \
+      > /home/comfy/.local/share/spark-comfyui-cluster/python \
+ && chmod 755 /home/comfy/.local/share/spark-comfyui-cluster/python
 # The worker loop filters its environment to an allowlist before Monarch
 # spawns actors (dgx-monarch cli/worker_process_env.py), and TRITON_PTXAS_PATH
 # is not on it, so the actors lose it (measured in-image) and any Triton JIT

@@ -2121,6 +2121,10 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     -v "$CLUSTER_CONF:/home/comfy/.config/dgx-monarch/cluster.toml:ro"
     -e SPARK_MONARCH=1
   )
+  # Continuity's H3 renders sample on the cluster by default in this mode
+  # (the image's spark-continuity-monarch overlay); 0 keeps them on this card.
+  [[ -z "${SPARK_CONTINUITY_MONARCH:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_CONTINUITY_MONARCH=$SPARK_CONTINUITY_MONARCH")
   if [[ "$role" == worker ]]; then
     CRUN_ARGS+=(
       -e SPARK_ROLE=worker
