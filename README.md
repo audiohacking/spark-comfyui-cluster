@@ -192,8 +192,18 @@ The VAE one has a flag form, `--no-bf16-vae`, which works with any command:
 | `TORCH_VERSION` | `2.14.0` | Pinned so a PyTorch release can never change your stack without you asking. |
 | `TORCHVISION_VERSION` | `0.29.0` | Pinned alongside torch. |
 | `TORCHAUDIO_VERSION` | `2.11.0` | Pinned alongside torch. |
+| `COMFY_REF` | upstream `master` | ComfyUI to build: a full 40-character commit sha, a tag or a branch. Set it in `spark-comfyui.env` to keep every build on a version you have tested. |
+| `CONTINUITY_REF` | not pinned | Continuity commit, tag or branch. On every start each container moves its existing Continuity checkout in `custom_nodes` to this ref. A checkout with local edits is left alone, and nothing is cloned. |
 
 `doctor` tells you when a newer torch is on the index, and `update --torch` builds against it, ignoring the pin. If that passes `doctor` and a generation, move the pin.
+
+To pin a tested stack, put the pins in `spark-comfyui.env` on every Spark (dgx-monarch's is `MONARCH_REF`, see Clustering → Settings), then run `install` and, in cluster mode, `cluster push`:
+
+```bash
+COMFY_REF=250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a
+CONTINUITY_REF=00a9a8fe699232704b65d835ebaf80111c27fb99
+MONARCH_REF=v1.3.0
+```
 
 ### Disk
 
@@ -353,7 +363,7 @@ Every install of this fork gets [Continuity](https://github.com/roadmaus/ComfyUI
 - **Missing:** installed at its latest release on the next start.
 - **Already there:** left alone, and found by folder name, pyproject name, git remote or declared repository. That covers a git clone from before, or one in a shared `custom_nodes`.
 - **Updating:** use **Manager → Custom Nodes Manager → Continuity → Update** in the ComfyUI UI. The node lives in your `custom_nodes`, so the update persists across restarts and image updates, and the default list never downgrades it.
-- **Pinning a version:** put a pinned entry for it in your own `comfyui-nodes.list`.
+- **Pinning a version:** set `CONTINUITY_REF` (see Build pins). Updating through Manager then lasts only until the next start.
 - **Opting out:** `SPARK_DEFAULT_NODES=0` skips the list. Uninstalling it through Manager only lasts until the next start, because the list then installs it again.
 - **Changing the defaults:** edit `container/default-nodes.list` in the repo and run `update`. The change reaches every Spark with the image.
 
@@ -667,6 +677,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | Keep a known-good pair | `update --keep=h3-ok` pins the image you leave as `:keep-h3-ok` |
 | Follow dgx-monarch's main branch | `MONARCH_REF=main ./spark-comfyui.sh update`, then `cluster push` |
 | Pin an exact dgx-monarch | `MONARCH_REF=v1.3.0` (any tag, branch or commit) |
+| Pin ComfyUI and Continuity | `COMFY_REF` and `CONTINUITY_REF` in `spark-comfyui.env` on every Spark (see Build pins) |
 | Add a Spark | Add a `[[hosts]]` block, copy the file everywhere, `cluster push <ip>`, then restart the driver |
 | Restart a worker | `cluster worker --restart` on that Spark |
 | Remove a worker | `cluster worker --disable` |
