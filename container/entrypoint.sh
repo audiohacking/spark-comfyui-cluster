@@ -332,6 +332,61 @@ else
     fi
   fi
 fi
+
+# 2b. Pinned node packs. SPARK_CONTINUITY_REF holds Continuity at one commit,
+#     tag or branch on every Spark, because the overlay in this image hooks its
+#     internals and its master moves under it. The pack is the git checkout
+#     in custom_nodes whose origin is the pack's repo, whatever its directory
+#     is called (a git clone is ComfyUI-Continuity, a registry install
+#     'continuity'). Only an existing checkout is moved, and only when it has
+#     no local edits; nothing is cloned or created here. Still under the
+#     cluster-mode lock, so a driver and a worker on one Spark take turns.
+pin_node() {
+  local url="$1" ref="$2" d r dir="" want head
+  url="${url,,}"; url="${url%/}"; url="${url%.git}"
+  for d in "$INSTALL_DIR"/custom_nodes/*/; do
+    d="${d%/}"
+    [[ -e "$d/.git" ]] || continue
+    r="$(git -C "$d" config --get remote.origin.url 2>/dev/null || true)"
+    r="${r,,}"; r="${r%/}"; r="${r%.git}"
+    [[ "$r" == "$url" ]] && { dir="$d"; break; }
+  done
+  if [[ -z "$dir" ]]; then
+    warn "pin $ref: no git checkout of $1 in custom_nodes — left unpinned"
+    return 0
+  fi
+  # The checkout belongs to the host user, not the container's uid.
+  local g=(git -c safe.directory="$dir" -C "$dir")
+  want="$("${g[@]}" rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true)"
+  # A branch pin follows the remote branch, not a stale local one.
+  if [[ -z "$want" || -n "$(timeout 30 "${g[@]}" ls-remote --heads origin "$ref" 2>/dev/null </dev/null || true)" ]]; then
+    timeout 120 "${g[@]}" fetch -q --tags origin </dev/null 2>/dev/null \
+      || warn "pin $ref: fetching ${dir##*/} failed — using what is on disk"
+    want="$("${g[@]}" rev-parse -q --verify "origin/$ref^{commit}" 2>/dev/null \
+            || "${g[@]}" rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true)"
+  fi
+  if [[ -z "$want" ]]; then
+    warn "pin $ref: no such commit, tag or branch in ${dir##*/} — left as it is"
+    return 0
+  fi
+  head="$("${g[@]}" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$head" == "$want" ]]; then
+    info "${dir##*/} pinned at ${want:0:12} ($ref)"
+  elif [[ -n "$("${g[@]}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    warn "pin $ref: ${dir##*/} has local edits — left at ${head:0:12}"
+  elif "${g[@]}" checkout -q --detach "$want" 2>/dev/null; then
+    info "${dir##*/} moved ${head:0:12} -> ${want:0:12} ($ref)"
+  else
+    warn "pin $ref: checking out ${want:0:12} in ${dir##*/} failed — left at ${head:0:12}"
+  fi
+}
+if [[ -n "${SPARK_CONTINUITY_REF:-}" ]]; then
+  if [[ "$SPARK_CONTINUITY_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    pin_node https://github.com/roadmaus/ComfyUI-Continuity "$SPARK_CONTINUITY_REF"
+  else
+    warn "ignoring malformed SPARK_CONTINUITY_REF: $SPARK_CONTINUITY_REF"
+  fi
+fi
 # Release the cluster-mode lock (a no-op when it was never taken).
 exec 9>&- 2>/dev/null || true
 

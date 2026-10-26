@@ -324,6 +324,15 @@ CLUSTER_CONF="${CLUSTER_CONF:-$BASE_DIR/spark-cluster.toml}"
 # branch name, so the build cache key is the exact source.
 MONARCH_REPO="${MONARCH_REPO:-https://github.com/Deen-Media/dgx-monarch.git}"
 MONARCH_REF="${MONARCH_REF:-}"
+# Which ComfyUI to build: empty follows upstream master (resolved at every
+# build, so 'update' moves it); COMFY_REF pins a full commit sha, a tag or a
+# branch. Same resolution as MONARCH_REF.
+COMFY_REF="${COMFY_REF:-}"
+# Which Continuity every container holds, as a commit, tag or branch of
+# roadmaus/ComfyUI-Continuity. The pack lives in custom_nodes, not in the
+# image, so the entrypoint moves its existing git checkout there on each start
+# (never clones, never touches a checkout with local edits). Empty: left as is.
+CONTINUITY_REF="${CONTINUITY_REF:-}"
 # The worker container on this Spark. Named after the driver container so an
 # alternate CONTAINER_NAME (a test install) gets an alternate worker too.
 WORKER_NAME="${WORKER_NAME:-${CONTAINER_NAME:-spark-comfyui}-worker}"
@@ -1772,14 +1781,24 @@ the NVIDIA Container Toolkit, then re-run."
 passthrough may fail (install/configure the NVIDIA Container Toolkit)"
 }
 
-# Current upstream ComfyUI master, or empty if unreachable. The '|| true' is
+# The ComfyUI commit to build (COMFY_REF, default master), or empty if unreachable. The '|| true' is
 # load-bearing: under 'set -euo pipefail' a failed ls-remote would otherwise
 # take the caller down at the assignment, before it could print its own
 # message. Callers decide what empty means — cmd_build dies, the cold-build
 # check just skips.
 _resolve_comfy_master() {
-  timeout "${1:-30}" git ls-remote "$REPO_URL" refs/heads/master 2>/dev/null \
-    | awk 'NR==1{print $1}' || true
+  _resolve_git_ref "$REPO_URL" "${COMFY_REF:-master}" "${1:-30}"
+}
+
+# A commit for REF in REPO, or empty: a full sha as is, else the peeled tag,
+# a lightweight tag or a branch, in that order. An abbreviated sha cannot be
+# looked up remotely, so it resolves to nothing and the caller says so.
+_resolve_git_ref() {
+  local repo="$1" ref="$2" out
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && { echo "$ref"; return 0; }
+  out="$(timeout "${3:-30}" git ls-remote "$repo" \
+           "refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref" 2>/dev/null || true)"
+  { grep -m1 '\^{}$' <<<"$out" || head -1 <<<"$out"; } | awk '{print $1}' || true
 }
 
 # The build-arg set, in one place, because two callers must build the SAME
@@ -1835,22 +1854,18 @@ _resolve_monarch_ref() {
     ref="$tag"
   fi
   # A full sha needs no lookup (and ls-remote could not find one anyway).
-  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && { echo "$ref"; return 0; }
-  out="$(timeout "${1:-30}" git ls-remote "$MONARCH_REPO" \
-           "refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref" 2>/dev/null || true)"
-  # Peeled tag first, then a lightweight tag or branch.
-  { grep -m1 '\^{}$' <<<"$out" || head -1 <<<"$out"; } | awk '{print $1}' || true
+  _resolve_git_ref "$MONARCH_REPO" "$ref" "${1:-30}"
 }
 
 cmd_build() {
   need_docker
   seed_mounts_conf
-  log "Resolving upstream ComfyUI master"
+  log "Resolving upstream ComfyUI ${COMFY_REF:-master}"
   local comfy_sha
   comfy_sha="$(_resolve_comfy_master)"
   [[ -n "$comfy_sha" ]] \
-    || die "could not resolve ComfyUI master from $REPO_URL (offline or
-unreachable) — check the network and re-run"
+    || die "could not resolve ComfyUI ${COMFY_REF:-master} from $REPO_URL (offline,
+unreachable, or no such ref; a commit pin must be the full 40-character sha)"
   # The target is chosen here and not in _image_build_args, because the
   # cold-build check shares those args and passes its own --target.
   local target=runtime monarch_sha="" monarch_note=""
@@ -2068,6 +2083,7 @@ the calling uid, and root would write root-owned files into your content"
     -e SPARK_RESERVE_VRAM
     -e SPARK_ATTENTION
   )
+  [[ -z "$CONTINUITY_REF" ]] || CRUN_ARGS+=(-e "SPARK_CONTINUITY_REF=$CONTINUITY_REF")
   if cluster_mode; then
     _cluster_run_args "$role"
   else
@@ -2720,12 +2736,12 @@ cold_build_check() {
   if docker build --target final --no-cache-filter=final \
        -t "$CONTAINER_IMAGE:cold-check" \
        "${IMG_BUILD_ARGS[@]}" "$BASE_DIR" >"$blog" 2>&1; then
-    ok "a fresh install builds against current ComfyUI master"
+    ok "a fresh install builds against current ComfyUI ${COMFY_REF:-master}"
     rm -f "$blog"
   else
     # Loud on purpose. This does NOT mean the running install is broken; it
     # means the front door is, which is the failure nobody here can see.
-    bad "a fresh install would FAIL against current ComfyUI master (${sha:0:12})
+    bad "a fresh install would FAIL against current ComfyUI ${COMFY_REF:-master} (${sha:0:12})
   your existing install is unaffected — this is the new-user path"
     echo "  last lines of the build:"
     tail -15 "$blog" | sed 's/^/    /'
@@ -2834,9 +2850,9 @@ cmd_doctor() {
     if [[ -z "$upsha" ]]; then
       info "upstream ComfyUI unreachable — image staleness unknown"
     elif [[ "$upsha" == "$csha" ]]; then
-      info "image is at upstream ComfyUI master HEAD"
+      info "image is at upstream ComfyUI ${COMFY_REF:-master}"
     else
-      info "upstream ComfyUI master has moved (now ${upsha:0:12}) — a rebuild picks it up: $0 update"
+      info "upstream ComfyUI ${COMFY_REF:-master} has moved (now ${upsha:0:12}) — a rebuild picks it up: $0 update"
     fi
     # torch drift, the same shape as the ComfyUI check above and for the same
     # reason: the trio is pinned, so without this the pin would quietly go
