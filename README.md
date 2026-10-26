@@ -33,7 +33,7 @@ What the fork adds:
 | Container roles | ComfyUI only | `SPARK_ROLE=driver` (ComfyUI, the default) or `worker` (a dgx-monarch worker loop). `SPARK_MONARCH=1` loads the dgx-monarch node pack from the image, not from your `custom_nodes`. |
 | Networking | Bridge network, `-p PORT:8188` | Unchanged stand-alone. Cluster mode uses `--network host --pid host`, the RDMA devices and an unlimited memlock limit, because Monarch and NCCL need the fabric and dgx-monarch's probes read the host's `/proc`. |
 | Default nodes | — | [Continuity](https://github.com/roadmaus/ComfyUI-Continuity) is installed on every start when missing, and can be updated from ComfyUI Manager. See [Bundled by default: Continuity](#bundled-by-default-continuity). In cluster mode its H3 renders sample across the Sparks ([Continuity on the cluster](#continuity-on-the-cluster)). |
-| Commands | — | `cluster init \| worker \| push \| status \| dgxm`, see [Clustering](#clustering-dgx-monarch). |
+| Commands | — | `cluster init \| worker \| push \| status \| dgxm \| models`, see [Clustering](#clustering-dgx-monarch). |
 | Upgrades | `update` / `--rollback` / `--keep` for ComfyUI | The same commands also move and snapshot dgx-monarch (`org.spark-comfyui.monarch-sha` label). `cluster push` syncs the result to every Spark. |
 | Several installs per box | One per Spark (fixed names, port 8188) | UI on port **8182** by default, so it never lands on a stock install's 8188. A per-folder `spark-comfyui.env` sets the container, image and cache volume names (and the port), and `run`/`service` refuse a port someone else holds. See [Running two installs on one Spark](#running-two-installs-on-one-spark). |
 
@@ -113,7 +113,7 @@ Models go in `data/models/checkpoints` (etc.). No venv, no system Python changes
 | `prune [--yes]` | Reclaims disk: drops leftover image tags and trims the BuildKit cache to its age and size limits. Keeps `:latest`, `:previous` and every `keep-*` pin, and never rebuilds. Shows what goes before it goes. |
 | `reset [--yes]` | Removes the container, all image tags and the cache volume; rebuilds from scratch. `data/` is never touched. Unlike `prune`, this does drop `keep-*` pins. |
 | `recipe list\|show\|check\|install\|capture` | Everything a workflow needs, as data: the workflow, its custom nodes, and every model with a destination, size and sha256. `install` downloads what is missing (resumable, hash-verified) and wires up the rest. `capture` authors one from a workflow that already runs here. |
-| `cluster init\|worker\|push\|status\|dgxm` | Splits renders across several Sparks with [dgx-monarch](https://github.com/Deen-Media/dgx-monarch). Off until `spark-cluster.toml` exists. See [Clustering](#clustering-dgx-monarch). |
+| `cluster init\|worker\|push\|status\|dgxm\|models` | Splits renders across several Sparks with [dgx-monarch](https://github.com/Deen-Media/dgx-monarch). Off until `spark-cluster.toml` exists. `cluster models list\|sync` compares and copies model files between the Sparks by name. See [Clustering](#clustering-dgx-monarch). |
 | `shell` | Opens a bash shell inside the running container. For inspecting the venv or a custom node. The image is immutable, so nothing you change there survives a restart. |
 
 ## Configuration
@@ -325,13 +325,17 @@ That works, but both installs then run the same custom node code and write the s
   - `reset` and `prune` never touch content, shared or not.
   - `restore` writes into whatever is mapped, including a shared folder.
   - `backup` manifests models and never archives them, so a shared `models` doesn't make backups bigger.
-- **Clustering:** every Spark needs the same models at the same relative paths. Each Spark has its own disk, so copy just the files a workflow needs once over the fabric. Don't download them again:
+- **Clustering:** every Spark needs the same models at the same relative paths. Each Spark has its own disk, so copy just the files a workflow needs once over the fabric. Don't download them again. `cluster models` does it by name:
 
   ```bash
-  # from A: send A's diffusion models to B over the fabric, resumable
-  rsync -a --partial --info=progress2 ~/Documents/ComfyUI/spark-comfyui/data/models/diffusion_models/ \
-        192.168.100.12:~/Documents/ComfyUI/spark-comfyui/data/models/diffusion_models/
+  ./spark-comfyui.sh cluster models list --missing            # what differs between the Sparks
+  ./spark-comfyui.sh cluster models list h3                   # every model whose path contains 'h3'
+  ./spark-comfyui.sh cluster models sync --dry-run 'diffusion_models/*h3*'   # show what would be copied
+  ./spark-comfyui.sh cluster models sync 'diffusion_models/*h3*'             # copy from this Spark to every other one
+  ./spark-comfyui.sh cluster models sync --from 192.168.100.11 turbo         # pull matching files from another Spark
   ```
+
+  A pattern is part of the path under `models/` (case-insensitive), or a glob matched against the path or the file name. `sync` uses rsync over ssh (the same key access as `cluster push`). It only adds missing files: a file that exists on the target, even at another size, is reported and left alone, and nothing is deleted. Each Spark finds its own `models` folder from its own `spark-mounts.conf` and `DATA_DIR`, so the checkout must be up to date on every Spark. The folder must already exist; it is never created. An interrupted copy leaves no partial file behind, so re-run the same command to finish.
 
   A network share mapped with `models = /mnt/share/models` on every Spark works too, but each rank then loads the weights over the network.
 

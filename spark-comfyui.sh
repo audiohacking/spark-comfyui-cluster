@@ -81,7 +81,7 @@
 #                              'capture' authors one from a workflow that
 #                              already runs here. Recipes live in recipes/
 #                              and are tracked, so a recipe is shareable.
-#    cluster init|worker|push|status|dgxm
+#    cluster init|worker|push|status|dgxm|models
 #                              Split renders across several Sparks with
 #                              dgx-monarch. Off until spark-cluster.toml
 #                              exists ('cluster init' seeds it); then the
@@ -94,6 +94,11 @@
 #                              the other Sparks so every rank runs identical
 #                              bytes; 'status' compares them; 'dgxm ARGS'
 #                              runs dgxm doctor/status/top in the container.
+#                              'models list [--missing] [PATTERN...]' shows
+#                              which model files each Spark has; 'models
+#                              sync [--from HOST] [--to HOST] [--dry-run]
+#                              PATTERN...' copies the matching ones that are
+#                              missing (rsync over ssh; never overwrites).
 #    backup [--with-output] [FILE]
 #                              Archive the small precious state: workflows,
 #                              settings, inputs, patch and node lists,
@@ -966,7 +971,7 @@ cmd_status() {
     done
     local gpu_csv t p c u pst thr evt evt_val mem_used mem_tot mem_cache
     local swap_used swap_tot cpu_pct load1 io_now io_rate now_ts prev_io='' prev_ts=''
-    local prev_idle=0 prev_tot=0 pid cand rss gen_hdr
+    local prev_idle=0 prev_tot=0 pid rss gen_hdr
     local gself gother state_bad
     local -a lines
     # Session A/B aggregates (see the fin_id accounting in the loop): g_durs
@@ -3165,7 +3170,8 @@ cmd_cluster() {
     push)   cluster_push "$@" ;;
     status) cluster_status "$@" ;;
     dgxm)   cluster_dgxm "$@" ;;
-    *) die "usage: $0 cluster init | worker [--restart|--disable] | push [--no-restart] [HOST...] | status | dgxm ARGS..." ;;
+    models) cluster_models "$@" ;;
+    *) die "usage: $0 cluster init | worker [--restart|--disable] | push [--no-restart] [HOST...] | status | dgxm ARGS... | models list|sync ..." ;;
   esac
 }
 
@@ -3381,7 +3387,7 @@ Spark (local: $(hostname -I 2>/dev/null)) — fix the file, or set SPARK_WORKER_
 cluster_push() {
   need_docker
   _need_cluster
-  local do_restart=1 hosts=() rows name addr user dest lid rid remote_script
+  local do_restart=1 hosts=() rows name user dest lid rid remote_script
   [[ "${1:-}" == "--no-restart" ]] && { do_restart=0; shift; }
   lid="$(docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null)" \
     || die "no $CONTAINER_IMAGE:latest here — build it first: $0 update"
@@ -3435,10 +3441,10 @@ cluster_status() {
            "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
   echo "  image: ${lid:7:12} dgx-monarch ${msha:0:12}"
   [[ -n "$msha" ]] || echo "  (not a cluster image — build it: $0 update)"
-  while IFS= read -r line; do
-    [[ "$line" == WARN$'\t'* ]] && warn "${line#WARN$'\t'}"
   # The literal ~ is the point: it is compared against the config text.
   # shellcheck disable=SC2088
+  while IFS= read -r line; do
+    [[ "$line" == WARN$'\t'* ]] && warn "${line#WARN$'\t'}"
   done < <(_cluster_read check "~/$MONARCH_PY_REL" || true)
   row="$(_cluster_local_row)"
   state="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' \
@@ -3461,6 +3467,162 @@ cluster_status() {
       echo "  $name: DIFFERENT image ${rid:7:12} (dgx-monarch ${rmsha:0:12}) — worker $state; sync: $0 cluster push $name"
     fi
   done <<<"$rows"
+}
+
+# --- cluster models: compare and copy model files between the Sparks ------
+# Every rank loads the same relative paths, but each Spark has its own disk.
+# Each host is indexed by its own copy of this script ('cluster models
+# index'), so its own spark-mounts.conf and DATA_DIR decide where models/
+# is. Copies only ever add missing files: nothing is overwritten or deleted.
+
+# This Spark's models folder, resolved exactly as a launch resolves it. It
+# must exist already; the copy fills it, it never creates it.
+_models_root() {
+  local root
+  resolve_mounts
+  root="$(_mount_path models)"
+  [[ -d "$root" ]] || die "the models folder does not exist: $root"
+  readlink -f "$root"
+}
+
+# "<path relative to models/>\t<bytes>" per file, following symlinks. Hidden
+# entries are skipped, which also hides rsync's in-flight temp files.
+_models_index() {
+  find -L "$1" -mindepth 1 \( -name '.*' -prune \) -o \( -type f -printf '%P\t%s\n' \) \
+      2>/dev/null | awk -F'\t' 'NF == 2' || true
+}
+
+# Index this Spark and every reachable [[hosts]] entry. Sets MODEL_HOSTS
+# (labels, this Spark first), MODEL_ROOT/MODEL_DEST (label -> models path /
+# ssh destination) and MODEL_INDEX ("label\tpath\tbytes" lines).
+_cluster_models_scan() {
+  local me root rows name user dest out remote_script
+  declare -gA MODEL_ROOT=() MODEL_DEST=()
+  MODEL_HOSTS=() MODEL_INDEX=""
+  me="$(_cluster_local_row | cut -f1)"
+  me="${me:-this-spark}"
+  root="$(_models_root)"
+  MODEL_HOSTS+=("$me"); MODEL_ROOT[$me]="$root"; MODEL_DEST[$me]=""
+  MODEL_INDEX+="$(_models_index "$root" | awk -v h="$me" '{print h "\t" $0}')"$'\n'
+  rows="$(_cluster_remote_rows)"
+  remote_script="${SPARK_REMOTE_SCRIPT:-$SELF}"
+  while IFS=$'\t' read -r name _ user; do
+    [[ -n "$name" ]] || continue
+    dest="$(_cluster_dest "$name" "$user")"
+    out="$(_cluster_ssh "$dest" "$(printf '%q ' "$remote_script" cluster models index)" </dev/null)" \
+      || { warn "$name: could not list its models (see above); skipped"; continue; }
+    root="$(awk -F'\t' '$1 == "ROOT" {print $2; exit}' <<<"$out")"
+    [[ -n "$root" ]] \
+      || { warn "$name: no models listing — is $remote_script there and up to date (git pull)? skipped"; continue; }
+    MODEL_HOSTS+=("$name"); MODEL_ROOT[$name]="$root"; MODEL_DEST[$name]="$dest"
+    MODEL_INDEX+="$(awk -F'\t' -v h="$name" '$1 == "F" && NF == 3 {print h "\t" $2 "\t" $3}' <<<"$out")"$'\n'
+  done <<<"$rows"
+}
+
+_cluster_models_usage() {
+  die "usage: $0 cluster models list [--missing] [PATTERN...]
+       $0 cluster models sync [--from HOST] [--to HOST]... [--dry-run] PATTERN...
+PATTERN is part of the path under models/ (case-insensitive), or a glob such
+as 'diffusion_models/*h3*' or '*.safetensors' matched against the path or
+the file name."
+}
+
+cluster_models() {
+  local sub="${1:-list}" root
+  shift || true
+  case "$sub" in
+    # Machine-readable, for the scan above when it runs on another Spark.
+    index)
+      root="$(_models_root)"
+      printf 'ROOT\t%s\n' "$root"
+      _models_index "$root" | awk '{print "F\t" $0}'
+      ;;
+    list) cluster_models_list "$@" ;;
+    sync) cluster_models_sync "$@" ;;
+    *)    _cluster_models_usage ;;
+  esac
+}
+
+cluster_models_list() {
+  _need_cluster
+  local a
+  for a in "$@"; do
+    [[ "$a" == -* && "$a" != "--missing" ]] && _cluster_models_usage
+  done
+  _cluster_models_scan
+  hdr "Models on ${#MODEL_HOSTS[@]} host(s)"
+  python3 "$LIB_DIR/cluster_models.py" list "$(IFS=,; echo "${MODEL_HOSTS[*]}")" "$@" <<<"$MODEL_INDEX"
+}
+
+cluster_models_sync() {
+  _need_cluster
+  local from="" to=() patterns=() dry=0 me t h plan files bytes line size rsh
+  local -a list
+  while (( $# )); do
+    case "$1" in
+      --from)      from="${2:-}"; shift ;;
+      --from=*)    from="${1#*=}" ;;
+      --to)        to+=("${2:-}"); shift ;;
+      --to=*)      to+=("${1#*=}") ;;
+      -n|--dry-run) dry=1 ;;
+      -*)          _cluster_models_usage ;;
+      *)           patterns+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#patterns[@]} )) || _cluster_models_usage
+  command -v rsync >/dev/null 2>&1 || die "rsync not found on this Spark (apt install rsync)"
+  _cluster_models_scan
+  me="${MODEL_HOSTS[0]}"
+  from="${from:-$me}"
+  [[ " ${MODEL_HOSTS[*]} " == *" $from "* ]] \
+    || die "--from $from: not a reachable [[hosts]] name (have: ${MODEL_HOSTS[*]})"
+  if (( ! ${#to[@]} )); then
+    # Send to everyone, or pull here.
+    if [[ "$from" == "$me" ]]; then to=("${MODEL_HOSTS[@]:1}"); else to=("$me"); fi
+  fi
+  (( ${#to[@]} )) || die "no other reachable host to copy to"
+  for t in "${to[@]}"; do
+    [[ " ${MODEL_HOSTS[*]} " == *" $t "* ]] \
+      || die "--to $t: not a reachable [[hosts]] name (have: ${MODEL_HOSTS[*]})"
+    [[ "$t" != "$from" ]] || die "--to $t is the source"
+    [[ "$from" == "$me" || "$t" == "$me" ]] \
+      || die "copies run between this Spark and one other; to send $from -> $t, run this on $from"
+  done
+  plan="$(python3 "$LIB_DIR/cluster_models.py" plan "$(IFS=,; echo "${MODEL_HOSTS[*]}")" \
+            "$from" "${patterns[@]}" <<<"$MODEL_INDEX")" \
+    || die "nothing on $from matches: ${patterns[*]}"
+  rsh="ssh -o BatchMode=yes -o ConnectTimeout=10"
+  for t in "${to[@]}"; do
+    while IFS=$'\t' read -r line size; do
+      warn "$t has $line at another size ($(numfmt --to=iec "$size" 2>/dev/null || echo "${size}B")); left alone — remove or rename it there to copy it again"
+    done < <(awk -F'\t' -v t="$t" '$1 == "DIFF" && $2 == t {print $3 "\t" $5}' <<<"$plan")
+    list=()
+    bytes=0
+    while IFS=$'\t' read -r _ h line size; do
+      list+=("$line")
+      bytes=$((bytes + size))
+    done < <(awk -F'\t' -v t="$t" '$1 == "COPY" && $2 == t' <<<"$plan")
+    if (( ! ${#list[@]} )); then
+      info "$t already has every matching file from $from"
+      continue
+    fi
+    log "$from -> $t: ${#list[@]} file(s), $(numfmt --to=iec "$bytes" 2>/dev/null || echo "${bytes}B")"
+    printf '    %s\n' "${list[@]}"
+    (( dry )) && continue
+    # No --partial: an interrupted file is never left under its real name,
+    # so a re-run copies it again instead of skipping a truncated model.
+    if [[ "$from" == "$me" ]]; then
+      files="${MODEL_ROOT[$me]}/" ; h="${MODEL_DEST[$t]}:${MODEL_ROOT[$t]}/"
+    else
+      files="${MODEL_DEST[$from]}:${MODEL_ROOT[$from]}/" ; h="${MODEL_ROOT[$me]}/"
+    fi
+    rsync -rtLs --ignore-existing --info=progress2 -e "$rsh" \
+        --files-from=<(printf '%s\n' "${list[@]}") "$files" "$h" \
+      || die "copy $from -> $t failed. Finished files are complete; re-run to copy the rest"
+  done
+  (( dry )) && info "dry run: nothing copied"
+  return 0
 }
 
 # dgxm inside a running container: the driver if it runs here, else this
