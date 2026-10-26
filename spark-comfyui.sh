@@ -3486,9 +3486,12 @@ _models_root() {
 }
 
 # "<path relative to models/>\t<bytes>" per file, following symlinks. Hidden
-# entries are skipped, which also hides rsync's in-flight temp files.
+# entries are skipped, which also hides rsync's in-flight temp files, and so
+# are unfinished downloads: a copied .partial is only a broken file twice.
 _models_index() {
-  find -L "$1" -mindepth 1 \( -name '.*' -prune \) -o \( -type f -printf '%P\t%s\n' \) \
+  find -L "$1" -mindepth 1 \( -name '.*' -prune \) -o \( -type f \
+      ! \( -name '*.partial' -o -name '*.part' -o -name '*.incomplete' \
+           -o -name '*.aria2' -o -name '*.crdownload' \) -printf '%P\t%s\n' \) \
       2>/dev/null | awk -F'\t' 'NF == 2' || true
 }
 
