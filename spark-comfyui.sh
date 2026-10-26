@@ -3620,7 +3620,9 @@ cluster_models_sync() {
     else
       files="${MODEL_DEST[$from]}:${MODEL_ROOT[$from]}/" ; h="${MODEL_ROOT[$me]}/"
     fi
-    rsync -rtLs --ignore-existing --info=progress2 -e "$rsh" \
+    # --omit-dir-times: folders a container created can be root-owned, and
+    # stamping their mtime fails (exit 23) after every file has landed.
+    rsync -rtLs --omit-dir-times --ignore-existing --info=progress2 -e "$rsh" \
         --files-from=<(printf '%s\n' "${list[@]}") "$files" "$h" \
       || die "copy $from -> $t failed. Finished files are complete; re-run to copy the rest"
   done
