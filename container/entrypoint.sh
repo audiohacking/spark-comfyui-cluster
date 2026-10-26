@@ -355,8 +355,10 @@ pin_node() {
     warn "pin $ref: no git checkout of $1 in custom_nodes — left unpinned"
     return 0
   fi
-  # The checkout belongs to the host user, not the container's uid.
-  local g=(git -c safe.directory="$dir" -C "$dir")
+  # The checkout belongs to the host user, not the container's uid. File
+  # modes are not edits: a data folder copied between disks often turns
+  # every file executable, which would otherwise read as a dirty checkout.
+  local g=(git -c safe.directory="$dir" -c core.fileMode=false -C "$dir")
   want="$("${g[@]}" rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true)"
   # A branch pin follows the remote branch, not a stale local one.
   if [[ -z "$want" || -n "$(timeout 30 "${g[@]}" ls-remote --heads origin "$ref" 2>/dev/null </dev/null || true)" ]]; then
