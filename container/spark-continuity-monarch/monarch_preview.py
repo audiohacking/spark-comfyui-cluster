@@ -295,6 +295,14 @@ def _release_other_model(model):
                     outcome.status.value, outcome.detail)
 
 
+def sampler_wrapped():
+    """Whether dgx-monarch's sampler carries the preview wrapper."""
+    import nodes
+
+    cls = nodes.NODE_CLASS_MAPPINGS.get("DGXMonarchKSampler")
+    return bool(getattr(cls, "_spark_preview_wrapped", False))
+
+
 def wrap_sampler():
     """Wrap DGXMonarchKSampler.sample for a model carrying SparkMonarchPreview
     settings: the page-cache prefetch and the live preview. Renders without

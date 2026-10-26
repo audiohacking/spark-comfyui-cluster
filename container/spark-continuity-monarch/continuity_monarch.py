@@ -74,6 +74,9 @@ _LORA = ".creator.lora"
 _HOOKS = ("weights_from_blob", "preflight", "emit_loaders", "emit_segment",
           "_segment_inputs", "emit_control", "emit_sampler", "emit_refine",
           "emit_face", "emit_seam_restore")
+# Later local passes, wrapped where this Continuity has them (it gained them
+# after 041b9f5): they sample on this Spark like the face pass.
+_LOCAL_PASSES = ("emit_finish", "emit_motion_fix")
 
 _installed = False
 # What install() last concluded, for the status route and the logs.
@@ -81,7 +84,8 @@ STATE = {"installed": False, "reason": "not attempted"}
 
 
 def status():
-    return {**STATE, "auto": auto(), "backends": _backends()}
+    return {**STATE, "auto": auto(), "backends": _backends(),
+            "preview": monarch_preview.sampler_wrapped()}
 
 
 def _backends():
@@ -134,7 +138,9 @@ def accel_blocker(acceleration):
             (acceleration.spectrum, "Spectrum"),
             (acceleration.chunk_ffn, "the chunked feed-forward"),
             (acceleration.fp16_accumulation, "fp16 accumulation"),
-            (acceleration.attention == "kitchen", "the kitchen attention kernel")):
+            (acceleration.attention == "kitchen", "the kitchen attention kernel"),
+            (getattr(acceleration, "vdn", "off") != "off", "VDN-H3"),
+            (acceleration.attention == "sla", "SLA sparse attention")):
         if on:
             return f"{what} patches a local model"
     if acceleration.attention == "sage" and attention_option("sage") is None:
@@ -438,6 +444,25 @@ def _wrap(cls, mods):
                emit_face, emit_seam_restore):
         fn.__wrapped__ = orig[fn.__name__]
         setattr(cls, fn.__name__, fn)
+
+    def local_pass(name, what):
+        original = getattr(cls, name)
+
+        def wrapped(self, *args, **kwargs):
+            if any(enabled(value) for value in (*args, *kwargs.values())):
+                log.info("Continuity: %s samples on this Spark", what)
+                args = [local(value) if enabled(value) else value for value in args]
+                kwargs = {key: local(value) if enabled(value) else value
+                          for key, value in kwargs.items()}
+            return original(self, *args, **kwargs)
+
+        wrapped.__name__ = name
+        wrapped.__wrapped__ = original
+        setattr(cls, name, wrapped)
+
+    for name, what in zip(_LOCAL_PASSES, ("the guide LoRA pass", "the motion fix")):
+        if callable(getattr(cls, name, None)):
+            local_pass(name, what)
     cls._spark_monarch = True
 
 
@@ -502,7 +527,8 @@ def install():
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
     if not monarch_preview.wrap_sampler():
-        log.warning("Continuity: dgx-monarch's sampler is not loaded; cluster renders will not preview")
+        log.info("Continuity: dgx-monarch's sampler is not registered yet; "
+                 "its preview is added on the next prompt")
     _installed = True
     STATE.update(installed=True, reason="",
                  continuity=mods["raylight"].__name__[: -len(_RAYLIGHT)])
