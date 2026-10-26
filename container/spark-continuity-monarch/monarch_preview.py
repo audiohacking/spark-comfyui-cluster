@@ -248,6 +248,53 @@ def _unload_after_prompt():
         log.debug("could not ask for an unload after this prompt: %r", exc)
 
 
+def _release_other_model(model):
+    """Reset the workers when they hold a different diffusion model.
+
+    dgx-monarch's H3 activation preflight reads MemAvailable on the driver
+    Spark and credits the DiT weights only when this render's model is the one
+    the workers already hold. On a switch (fl2va after ref2va, say) it reads
+    with the previous model still resident, about 40 GB per Spark under stock
+    residency, and charges the new weights on top, although the worker drops
+    the old model before loading the new one: a refusal of a render that fits.
+    A recycle, the Clear VRAM node's "recycle" level, stops the worker procs
+    and returns the model and the allocator pool to the OS; the render then
+    brings the fleet up again (about a minute) and loads the model it needs.
+    SPARK_MONARCH_RELEASE_ON_SWITCH=0 keeps the previous model resident.
+    """
+    if os.environ.get("SPARK_MONARCH_RELEASE_ON_SWITCH", "1").strip() == "0":
+        return
+    wanted = getattr(model, "unet_name", None)
+    handle = getattr(getattr(model, "mesh", None), "handle", None)
+    if not isinstance(wanted, str) or handle is None:
+        return
+    try:
+        from dgx_monarch.nodes import recycle_drain
+        from dgx_monarch.nodes import render_preflight as rp
+
+        # The same memos the preflight credits residency from.
+        held = {rp._LAST_RENDERED_UNET, rp._LAST_SUBMITTED_UNET,
+                rp._LAST_DRIVER_CHARGED_UNET} - {None}
+    except Exception as exc:
+        log.debug("cannot read the fleet's resident model: %r", exc)
+        return
+    if not held or wanted in held:
+        return
+    log.info("Continuity: the cluster holds %s; resetting the workers to load %s",
+             ", ".join(sorted(held)), wanted)
+    try:
+        outcome = handle.recycle_detailed()
+    except Exception:
+        log.exception("Continuity: the worker reset failed; the render goes ahead")
+        return
+    if outcome.ok:
+        # As the /dgxm/recycle route does: a new fleet holds none of the old weights.
+        recycle_drain.drop_residency_memos()
+    else:
+        log.warning("Continuity: the workers were not reset (%s: %s); the render goes ahead",
+                    outcome.status.value, outcome.detail)
+
+
 def wrap_sampler():
     """Wrap DGXMonarchKSampler.sample for a model carrying SparkMonarchPreview
     settings: the page-cache prefetch and the live preview. Renders without
@@ -263,6 +310,7 @@ def wrap_sampler():
         settings = getattr(model, "_spark_preview", None)
         if settings is None:
             return orig(self, model, *args, **kwargs)
+        _release_other_model(model)
         if settings.get("prefetch"):
             _prefetch(settings["prefetch"])
         _unload_after_prompt()
