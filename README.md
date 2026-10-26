@@ -436,7 +436,7 @@ On every Spark:
 
 1. **This repo at the same path**, on the same branch, with `install` done once. `cluster push` restarts remote workers with `ssh <host> <that path>/spark-comfyui.sh cluster worker --restart`. If the path differs, set `SPARK_REMOTE_SCRIPT`.
 2. **The same instance names.** If you use a `spark-comfyui.env`, use the same file everywhere. `cluster push` passes the image and container names along, but commands you run by hand on a worker read that worker's own file.
-3. **The same content.** The same models at the same relative paths under `models/`, and the same custom nodes (the same `comfyui-nodes.list`, plus `recipe install` on each). dgx-monarch loads the model on every rank.
+3. **The same content.** The same models at the same relative paths under `models/`, and the same custom nodes (the same `comfyui-nodes.list`, plus `recipe install` on each). dgx-monarch loads the model on every rank. `cluster models list --missing` shows what differs, and `cluster models sync` copies it ([Mounts → Things to know](#mounts)).
 4. **A fabric address.** Each Spark needs an IPv4 address on the ConnectX ports. Check them with `ip -br addr` and `ibdev2netdev`. A switch works for 2 to 64 Sparks with `fabric_profile = "generic-roce"`. Two Sparks on one direct cable can use `dgx-spark-pair`, the profile upstream measured.
 5. **A locked-down fabric.** The Monarch attach API has **no peer authentication**, and actors open dynamic ports, so a firewall rule for port 26600 alone isn't enough. Keep the fabric a dedicated network and source-restrict *all* traffic on it to the cluster hosts. Read upstream's [SECURITY.md](https://github.com/Deen-Media/dgx-monarch/blob/main/SECURITY.md#fabric-trust-boundary).
 
@@ -543,6 +543,7 @@ This finds the `[[hosts]]` row whose IP is local, starts the worker container, a
 ```bash
 ./spark-comfyui.sh cluster status        # worker health + image/monarch commit on every host, then dgxm status
 ./spark-comfyui.sh cluster dgxm doctor   # dgx-monarch's own end-to-end checks, run in the container
+./spark-comfyui.sh cluster models list --missing   # models missing on a Spark, or at another size
 ./spark-comfyui.sh service               # or 'run'; UI on http://<driver-ip>:$PORT
 ```
 
@@ -628,6 +629,8 @@ scp spark-cluster.toml 192.168.100.11:~/Documents/ComfyUI/spark-comfyui-cluster/
 ```bash
 ./spark-comfyui.sh cluster status       # both hosts: worker healthy, SAME image ID and monarch commit, no WARN
 ./spark-comfyui.sh cluster dgxm doctor  # dgx-monarch's own checks, all green
+./spark-comfyui.sh cluster models list --missing   # empty table = the same models on both
+./spark-comfyui.sh cluster models sync '*'         # if not: copy A's missing files to B (--from 192.168.100.11 for B's to A)
 ssh -i ~/.ssh/spark-comfyui-cluster/id_ed25519 192.168.100.11 '~/.local/share/spark-comfyui-cluster/python -c "print(1)"'   # prints 1
 ```
 
