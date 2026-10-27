@@ -295,6 +295,54 @@ def _release_other_model(model):
                     outcome.status.value, outcome.detail)
 
 
+def _mem_available():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _make_room(model):
+    """Free memory on every Spark right before the cluster samples.
+
+    dgx-monarch's H3 activation preflight compares this render's activations
+    with MemAvailable on the driver Spark, which this ComfyUI shares with
+    rank 0. By then Continuity has run the text encoder and the VAEs here,
+    and they stay loaded, idle, through the whole cluster sample: about 20 GB
+    that a long render or a large reference video needs. They reload from
+    the page cache when the local passes or the decode want them. The
+    workers drop their allocator caches too (Clear VRAM "soft"); their
+    weights stay resident. SPARK_MONARCH_FREE_BEFORE=0 keeps all of it.
+    """
+    if os.environ.get("SPARK_MONARCH_FREE_BEFORE", "1").strip() == "0":
+        return
+    import gc
+
+    import comfy.model_management as mm
+
+    before = _mem_available()
+    try:
+        mm.unload_all_models()
+        gc.collect()
+        mm.soft_empty_cache()
+    except Exception as exc:
+        log.debug("could not unload the driver's models: %r", exc)
+    handle = getattr(getattr(model, "mesh", None), "handle", None)
+    if handle is not None:
+        try:
+            handle.call_all("clear_vram", "soft", timeout_s=120)
+        except Exception as exc:
+            log.debug("could not clear the workers' allocator caches: %r", exc)
+    after = _mem_available()
+    if before is not None and after is not None:
+        log.info("Continuity: freed %.1f GiB on this Spark for the cluster render (%.1f GiB available)",
+                 (after - before) / 2 ** 30, after / 2 ** 30)
+
+
 def sampler_wrapped():
     """Whether dgx-monarch's sampler carries the preview wrapper."""
     import nodes
@@ -319,6 +367,7 @@ def wrap_sampler():
         if settings is None:
             return orig(self, model, *args, **kwargs)
         _release_other_model(model)
+        _make_room(model)
         if settings.get("prefetch"):
             _prefetch(settings["prefetch"])
         _unload_after_prompt()
