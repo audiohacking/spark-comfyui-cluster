@@ -2156,6 +2156,8 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     || CRUN_ARGS+=(-e "SPARK_MONARCH_UNLOAD_AFTER=$SPARK_MONARCH_UNLOAD_AFTER")
   [[ -z "${SPARK_MONARCH_RELEASE_ON_SWITCH:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_MONARCH_RELEASE_ON_SWITCH=$SPARK_MONARCH_RELEASE_ON_SWITCH")
+  [[ -z "${SPARK_MONARCH_FREE_BEFORE:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_MONARCH_FREE_BEFORE=$SPARK_MONARCH_FREE_BEFORE")
   if [[ "$role" == worker ]]; then
     CRUN_ARGS+=(
       -e SPARK_ROLE=worker
