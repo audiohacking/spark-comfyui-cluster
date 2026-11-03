@@ -443,12 +443,18 @@ ARG MONARCH_SHA=main
 # probes each worker host over ssh (listener generation and proc id), and
 # 'dgxm doctor' reaches the hosts the same way. rsync only satisfies doctor's
 # package-sync row: container mode never runs 'dgxm up', the images move whole.
+# libibverbs1 and ibverbs-providers (mlx5) are what NCCL opens the RoCE
+# devices with. /dev/infiniband alone is not enough: without them NCCL's IB
+# plugin fails to initialize and every collective silently falls back to TCP
+# sockets on the same NIC (an H3 Ulysses all-to-all measured 2.0 GB/s over
+# sockets, 11.3 GB/s over RoCE).
 USER root
 # /opt/monarch-nodes is created here, as root, because only root can give it
 # group 0: /opt carries no setgid bit, so a directory comfy creates lands in
 # group comfy and an arbitrary caller uid could not write it (caught by the
 # arbitrary-uid check, same as the runtime stage's three roots).
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client rsync \
+        libibverbs1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o comfy -g 0 -m 2775 /opt/monarch-nodes
 USER comfy
