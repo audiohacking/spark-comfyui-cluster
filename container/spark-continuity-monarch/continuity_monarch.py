@@ -54,6 +54,7 @@ import sys
 
 log = logging.getLogger("spark.continuity_monarch")
 
+from . import model_contract  # noqa: E402  (baked-distillation checkpoints)
 from . import monarch_preview  # noqa: E402  (driver-side preview glue)
 
 MONARCH = "monarch"
@@ -526,6 +527,7 @@ def install():
         mods["raylight"].BACKENDS.append(MONARCH)
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
+    STATE["contracts"] = model_contract.install(mods["render"].H3)
     if not monarch_preview.wrap_sampler():
         log.info("Continuity: dgx-monarch's sampler is not registered yet; "
                  "its preview is added on the next prompt")

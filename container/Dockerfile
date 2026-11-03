@@ -495,6 +495,7 @@ COPY --chown=comfy:0 container/monarch-paths.yaml /opt/spark/
 COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/continuity_monarch.py \
      container/spark-continuity-monarch/monarch_preview.py \
+     container/spark-continuity-monarch/model_contract.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/

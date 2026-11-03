@@ -669,6 +669,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
   - any shot with a turbo lead-in, a non-default sigma shift, a sound seam, a ControlNet guide or a model-patch accelerator.
 
   `comfyui_<PORT>.log` lists what ran where.
+- **Checkpoints with the distillation baked in** (for example [FastH3 Omni](https://huggingface.co/FastVideo/FastH3-Omni-Comfy), `fasth3_omniref_8step_pruned_int8_convrot.safetensors` in `models/diffusion_models`) are recognised from their file header. Pick one in the node's Ref2VA (or FL2VA) weights field and the render runs as the model was trained: 8 steps, euler with the simple scheduler, cfg 1, shifts 12/3, with the turbo switch, distillation LoRAs and step caches off, and every segment routed to that checkpoint unless the route names the other one. A toast and the log list what changed; your other LoRAs stay.
 - **Previews** work as on one GPU. For taeh3 previews, put [`taeh3.safetensors`](https://github.com/madebyollin/taehv/blob/main/safetensors/taeh3.safetensors) in `models/vae_approx`.
 - **First render:** the first render of a checkpoint and LoRA combination starts with dgx-monarch's identity gate, two short proof renders. Later renders skip it.
 - **Memory:** a render with a local pass loads a second copy of the model on the driver Spark, about 21 GB for H3 int8. Keep that much free there.
@@ -730,6 +731,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | `SPARK_MONARCH_UNLOAD_AFTER` | `1` | After each Continuity cluster render, the driver's ComfyUI unloads its models so the next render has the memory. `0` keeps them loaded. |
 | `SPARK_MONARCH_RELEASE_ON_SWITCH` | `1` | When a Continuity render asks for a different diffusion model than the cluster holds, the workers are reset first (about a minute) so the previous model's memory is free. `0` keeps it loaded. |
 | `SPARK_MONARCH_FREE_BEFORE` | `1` | Right before a Continuity render samples on the cluster, the driver's ComfyUI unloads its idle models (text encoder, VAEs) and the workers free their allocator caches, so long renders and large reference videos have the memory. Unloaded models reload when needed. `0` keeps them loaded. |
+| `SPARK_MODEL_CONTRACT` | `1` | Applies a baked-distillation checkpoint's own sampling settings to Continuity renders that use it (see Continuity on the cluster). `0` renders exactly as the node is set. |
 | `SPARK_MONARCH_NOTICES` | essentials | dgx-monarch's pop-up notices in ComfyUI: only warnings and errors by default. `all` shows every notice; all of them stay in the DGX Monarch panel either way. |
 
 ## Troubleshooting
