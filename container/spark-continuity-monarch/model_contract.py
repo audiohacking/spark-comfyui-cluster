@@ -30,6 +30,11 @@ it by hand:
   render never mixes two sampling contracts. Ref2VA weights take text-only and
   keyframe payloads too (Continuity's own route switch says so).
 
+The face pass, which re-noises the finished pass partway down the schedule,
+runs the contract's last k trained steps at denoise k/N, k being the nearest
+to the node's face denoise (0.45 of 8 steps: 4 steps at 0.5). ComfyUI's own
+partial schedule for 8 steps at 0.45 would fall between the trained intervals.
+
 One log line and one canvas toast name every change, against what the node
 said. The node's pills are not rewritten; save the workflow as it is and it
 stays that way. SPARK_MODEL_CONTRACT=0 turns this off.
@@ -41,6 +46,7 @@ the sampler row are all read from that same object afterwards.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -228,14 +234,36 @@ def _announce(terms, before, changes):
         pass  # no dgx-monarch here: the log line is the notice
 
 
+def on_grid(terms, denoise):
+    """(steps, denoise) for a partial pass that lands on the trained grid.
+
+    ComfyUI samples a partial pass as the tail of a `steps / denoise` schedule
+    (`KSampler.set_steps`), so 8 steps at 0.45 is the last 8 of a 17-step one,
+    whose sigmas sit between the intervals the PDD heads were distilled on. k
+    steps at k/N of an N-step contract are exactly its last k trained steps:
+    on the grid, and fewer forwards. k is the nearest whole step, at least one.
+    """
+    k = max(1, min(terms.steps, round(float(denoise) * terms.steps)))
+    return k, k / terms.steps
+
+
+def _checkpoint_of(weights, compiled):
+    try:
+        return weights.get(compiled.checkpoint)
+    except Exception:
+        return None
+
+
 def install(cls):
-    """Wrap Continuity's H3 `resolve_sampling` once. True when in place."""
+    """Wrap Continuity's H3 `resolve_sampling` and face pass once. True when
+    in place."""
     if getattr(cls, "_spark_contract", False):
         return True
     orig = getattr(cls, "resolve_sampling", None)
     if not callable(orig):
         log.warning("Continuity has no resolve_sampling; checkpoint contracts are off")
         return False
+    _install_face(cls)
 
     def resolve_sampling(self, data, widgets):
         if not enabled() or not isinstance(data, dict):
@@ -261,3 +289,31 @@ def install(cls):
     cls.resolve_sampling = resolve_sampling
     cls._spark_contract = True
     return True
+
+
+def _install_face(cls):
+    """The face pass re-noises the finished pass partway down the schedule;
+    on a baked checkpoint, put that partial schedule on the trained grid."""
+    orig = getattr(cls, "emit_face", None)
+    if not callable(orig):
+        return
+
+    def emit_face(self, graph, links, payload, compiled, face, written, weights,
+                  sampling, acceleration, seed):
+        terms = contract(_checkpoint_of(weights, compiled)) if enabled() else None
+        if terms is not None:
+            try:
+                steps, denoise = on_grid(terms, face.denoise)
+                if (steps, denoise) != (sampling.steps, face.denoise):
+                    log.info("Continuity: the face pass runs %s's last %d trained steps "
+                             "(denoise %g; the node asked %d steps at %g)",
+                             terms.checkpoint, steps, denoise, sampling.steps, face.denoise)
+                face = dataclasses.replace(face, denoise=denoise)
+                sampling = dataclasses.replace(sampling, steps=steps)
+            except Exception:
+                log.exception("Continuity: the face pass keeps the node's schedule")
+        return orig(self, graph, links, payload, compiled, face, written, weights,
+                    sampling, acceleration, seed)
+
+    emit_face.__wrapped__ = orig
+    cls.emit_face = emit_face

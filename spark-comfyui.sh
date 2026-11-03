@@ -2160,6 +2160,8 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     || CRUN_ARGS+=(-e "SPARK_MONARCH_FREE_BEFORE=$SPARK_MONARCH_FREE_BEFORE")
   [[ -z "${SPARK_MODEL_CONTRACT:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_MODEL_CONTRACT=$SPARK_MODEL_CONTRACT")
+  [[ -z "${SPARK_MONARCH_ATTENTION:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_MONARCH_ATTENTION=$SPARK_MONARCH_ATTENTION")
   if [[ "$role" == worker ]]; then
     CRUN_ARGS+=(
       -e SPARK_ROLE=worker

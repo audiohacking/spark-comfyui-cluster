@@ -732,6 +732,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | `SPARK_MONARCH_RELEASE_ON_SWITCH` | `1` | When a Continuity render asks for a different diffusion model than the cluster holds, the workers are reset first (about a minute) so the previous model's memory is free. `0` keeps it loaded. |
 | `SPARK_MONARCH_FREE_BEFORE` | `1` | Right before a Continuity render samples on the cluster, the driver's ComfyUI unloads its idle models (text encoder, VAEs) and the workers free their allocator caches, so long renders and large reference videos have the memory. Unloaded models reload when needed. `0` keeps them loaded. |
 | `SPARK_MODEL_CONTRACT` | `1` | Applies a baked-distillation checkpoint's own sampling settings to Continuity renders that use it (see Continuity on the cluster). `0` renders exactly as the node is set. |
+| `SPARK_MONARCH_ATTENTION` | unset | The attention kernel Continuity's cluster renders use when the node's attention is 'default'. Unset follows this ComfyUI: SageAttention when it runs with it, as on one card. A dgx-monarch kernel name (for example `TORCH_FLASH`, exact) overrides it. |
 | `SPARK_MONARCH_NOTICES` | essentials | dgx-monarch's pop-up notices in ComfyUI: only warnings and errors by default. `all` shows every notice; all of them stay in the DGX Monarch panel either way. |
 
 ## Troubleshooting
