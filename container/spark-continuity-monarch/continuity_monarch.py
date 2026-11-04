@@ -54,7 +54,6 @@ import sys
 
 log = logging.getLogger("spark.continuity_monarch")
 
-from . import model_contract  # noqa: E402  (baked-distillation checkpoints)
 from . import encode_reuse  # noqa: E402  (face pass reuses the pass's encodes)
 from . import monarch_preview  # noqa: E402  (driver-side preview glue)
 
@@ -170,30 +169,12 @@ def run_blocker(compiled, splits, sampling, anchors_anywhere):
 # ---- the mesh --------------------------------------------------------------
 
 
-def _driver_sage():
-    """Whether this ComfyUI runs SageAttention globally (--use-sage-attention),
-    which is what 'default' attention means on one card here."""
-    try:
-        import comfy.model_management as mm
-
-        return bool(mm.sage_attention_enabled())
-    except Exception:
-        try:
-            from comfy.cli_args import args
-
-            return bool(getattr(args, "use_sage_attention", False))
-        except Exception:
-            return False
-
-
 def attention_option(attention):
     """dgx-monarch's kernel for our setting, read off the installed class.
-    'default' follows this ComfyUI: on a driver started with SageAttention,
-    one card samples H3 with it, so the cluster does too rather than falling
-    back to the Init node's exact TORCH_FLASH. None leaves the Init node's own
-    pick, as does a dgx-monarch with no sage kernel. SPARK_MONARCH_ATTENTION
-    names one of the Init node's kernels for every 'default' render instead
-    (TORCH_FLASH for exact attention)."""
+    None leaves the Init node's own pick (exact TORCH_FLASH) for 'default', as
+    does a dgx-monarch with no sage kernel. SPARK_MONARCH_ATTENTION names one
+    of the Init node's kernels for every 'default' render instead (SAGE_AUTO
+    for quantized attention)."""
     declared = (_require(INIT_NODE).INPUT_TYPES().get("optional") or {}).get("attention")
     options = [str(option) for option in (declared[0] if declared else [])]
     forced = os.environ.get("SPARK_MONARCH_ATTENTION", "").strip()
@@ -202,8 +183,6 @@ def attention_option(attention):
             return forced
         log.warning("SPARK_MONARCH_ATTENTION=%s is not one of dgx-monarch's kernels "
                     "(%s); ignored", forced, ", ".join(options))
-    if attention == "default" and _driver_sage():
-        attention = "sage"
     if attention != "sage":
         return None
     return next((option for option in options if "SAGE" in option.upper()), None)
@@ -557,7 +536,6 @@ def install():
         mods["raylight"].BACKENDS.append(MONARCH)
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
-    STATE["contracts"] = model_contract.install(mods["render"].H3)
     STATE["encode_reuse"] = encode_reuse.install(mods["render"])
     if not monarch_preview.wrap_sampler():
         log.info("Continuity: dgx-monarch's sampler is not registered yet; "
