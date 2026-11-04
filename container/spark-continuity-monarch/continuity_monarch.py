@@ -55,6 +55,7 @@ import sys
 log = logging.getLogger("spark.continuity_monarch")
 
 from . import model_contract  # noqa: E402  (baked-distillation checkpoints)
+from . import encode_reuse  # noqa: E402  (face pass reuses the pass's encodes)
 from . import monarch_preview  # noqa: E402  (driver-side preview glue)
 
 MONARCH = "monarch"
@@ -557,6 +558,7 @@ def install():
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
     STATE["contracts"] = model_contract.install(mods["render"].H3)
+    STATE["encode_reuse"] = encode_reuse.install(mods["render"])
     if not monarch_preview.wrap_sampler():
         log.info("Continuity: dgx-monarch's sampler is not registered yet; "
                  "its preview is added on the next prompt")
