@@ -1,0 +1,107 @@
+diff --git a/src/dgx_monarch/actor/cancellation.py b/src/dgx_monarch/actor/cancellation.py
+index c7dada2..4bcf1f1 100644
+--- a/src/dgx_monarch/actor/cancellation.py
++++ b/src/dgx_monarch/actor/cancellation.py
+@@ -19,6 +19,45 @@ def raise_if_sample_cancelled(cancel_event: threading.Event | None) -> None:
+             "distributed render was cancelled before denoising")
+ 
+ 
++def cancel_agreed(cancel_event: threading.Event | None) -> bool:
++    """Whether ANY rank has seen this render's cancel, agreed by every rank.
++
++    The driver's cancel reaches each rank's event at its own moment, so a
++    rank-local check can stop one rank at a step boundary while its peer
++    starts the next step and waits in that step's first collective for a
++    partner that has left (until the NCCL timeout or a recycle). Every rank
++    of a render reaches the same boundaries in the same order (a topology's
++    degrees multiply to the world, topology.py), so a max all-reduce of the
++    local flags gives every rank the same answer at the same boundary: all
++    stop together, or all go on. One 4-byte collective per call. A world of
++    one, or no process group, keeps the local check.
++    """
++    local = cancel_event is not None and cancel_event.is_set()
++    try:
++        import torch
++        import torch.distributed as dist
++
++        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() < 2:
++            return local
++        # NCCL reduces device tensors; other backends (gloo) host ones.
++        device = (torch.device("cuda", torch.cuda.current_device())
++                  if dist.get_backend() == "nccl" else torch.device("cpu"))
++        flag = torch.tensor([1 if local else 0], dtype=torch.int32, device=device)
++        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
++        return bool(flag.item())
++    except ImportError:
++        return local
++
++
++def raise_if_sample_cancelled_agreed(cancel_event: threading.Event | None) -> None:
++    """``raise_if_sample_cancelled`` at a boundary every rank reaches, agreed."""
++    if cancel_agreed(cancel_event):
++        from .sampling import RenderCancelledError
++
++        raise RenderCancelledError(
++            "distributed render was cancelled before denoising")
++
++
+ class CancellableSampleMixin:
+     _gpu_lock: Any
+     _on_gpu: Any
+diff --git a/src/dgx_monarch/actor/sample_protocol.py b/src/dgx_monarch/actor/sample_protocol.py
+index 0e72467..5639ca5 100644
+--- a/src/dgx_monarch/actor/sample_protocol.py
++++ b/src/dgx_monarch/actor/sample_protocol.py
+@@ -13,7 +13,7 @@ from typing import Any
+ 
+ from ..model_sampling import normalize_model_sampling
+ from . import dm_cfg2_residency, guidance_render, latent_outputs, rank_readiness, store_fsdp, worker_env
+-from .cancellation import raise_if_sample_cancelled
++from .cancellation import raise_if_sample_cancelled, raise_if_sample_cancelled_agreed
+ 
+ 
+ def _sniff_request_family(worker, spec) -> str | None:
+@@ -399,7 +399,9 @@ def run_sample(
+         dp_cond_exempt_keys = adapter_for(
+             patcher.model, family_override).dp_cond_exempt_keys
+ 
+-    raise_if_sample_cancelled(cancel_event)
++    # The last boundary before the sampler's first collective, reached by
++    # every rank: agreed, so no rank enters the denoise loop alone.
++    raise_if_sample_cancelled_agreed(cancel_event)
+     if request["kind"] in ("ksampler", "ksampler_advanced"):
+         samples, out = run_ksampler(
+             render_patcher, request, progress_port, cancel_event=cancel_event,
+diff --git a/src/dgx_monarch/actor/sampling.py b/src/dgx_monarch/actor/sampling.py
+index a46d8bf..c5e9488 100644
+--- a/src/dgx_monarch/actor/sampling.py
++++ b/src/dgx_monarch/actor/sampling.py
+@@ -427,7 +427,11 @@ def make_progress_callback(progress_port, total_steps: int, cancel_event=None):
+         return None, lambda: None
+ 
+     def callback(step, x0, x, total):
+-        if cancel_event is not None and cancel_event.is_set():
++        # Agreed across ranks: every rank runs this callback at the same step,
++        # so all of them stop at the same boundary (cancellation.cancel_agreed).
++        from .cancellation import cancel_agreed
++
++        if cancel_event is not None and cancel_agreed(cancel_event):
+             raise RenderCancelledError("distributed render cancelled by the ComfyUI driver")
+         if progress_port is not None:
+             try:
+diff --git a/tests/test_rank_readiness.py b/tests/test_rank_readiness.py
+index ea376af..57c428c 100644
+--- a/tests/test_rank_readiness.py
++++ b/tests/test_rank_readiness.py
+@@ -386,7 +386,10 @@ def test_the_exchange_is_the_first_collective_of_the_render():
+     # Exempt by design: the guard the exchange runs ahead of; ring attention,
+     # which runs inside the sampler after the exchange; and every FSDP file,
+     # since an FSDP fleet takes no exchange.
+-    exempt = {"actor/partial_load_guard.py", "adapters/wan_ring_attention.py"}
++    # actor/cancellation.py's agreed cancel runs only after the exchange: at
++    # the last pre-denoise boundary and in the sampler's step callback.
++    exempt = {"actor/partial_load_guard.py", "adapters/wan_ring_attention.py",
++              "actor/cancellation.py"}
+ 
+     def _is_distributed(func: ast.Attribute) -> bool:
+         target = func.value

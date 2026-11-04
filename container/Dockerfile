@@ -483,7 +483,16 @@ USER comfy
 # condition time, per-token modulation rows where they differ), so Continuity's
 # face pass, a masked denoise, can sample on the cluster. Its tests are
 # upstream's, adjusted to the new contract.
-COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch /opt/spark/
+#
+# A third makes a cancel stop every rank at the same step. Each rank used to
+# check its own copy of the cancel at a step boundary; the driver's cancel
+# reaches them at different moments, so one rank could stop while its peer
+# started the next step and waited in that step's first collective for a
+# partner that had left, GPU spinning, until the NCCL timeout. The ranks now
+# agree with a 4-byte max all-reduce at each boundary, all of which every rank
+# reaches after the readiness exchange.
+COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
+     container/monarch-cancel-agree.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -492,6 +501,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-preview-x0.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-h3-mask.patch \
       || { echo "monarch-h3-mask.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-cancel-agree.patch \
+      || { echo "monarch-cancel-agree.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
