@@ -1,0 +1,320 @@
+diff --git a/src/dgx_monarch/adapters/minimax_h3.py b/src/dgx_monarch/adapters/minimax_h3.py
+index 70e6d6d..7a12b53 100644
+--- a/src/dgx_monarch/adapters/minimax_h3.py
++++ b/src/dgx_monarch/adapters/minimax_h3.py
+@@ -12,8 +12,10 @@ maskless and bidirectional, synthetic divisibility rows must be excluded from
+ Ulysses attention; padded Ring or hybrid execution refuses. H3 accepts batch 1,
+ while CFG parallel has no combined batch to split and data parallel cannot slice
+ its nested audio-video latent, so both topologies refuse before dispatch. A
+-latent noise mask refuses as well, because masked rows carry their own timestep
+-and therefore per-token modulation rows.
++latent noise mask runs as stock runs it: masked rows carry their own timestep,
++so the plan gives them their own modulation rows, per token where they differ
++(``h3_mask_times``). Those rows shard with the stream like any other, and
++modulation is elementwise, so the sharded result is the stock one.
+ 
+ Video uses the sampler schedule while audio modulation uses its own shifted
+ schedule. The bound outer forward restores and converts audio, so this inner
+@@ -47,6 +49,7 @@ from .base import (
+ )
+ from .minimax_h3_packing import (
+     _build_packed_layout,
++    h3_mask_times,
+     h3_modulation_plan,
+     h3_timestep_embedding,
+     pad_row_index,
+@@ -104,19 +107,23 @@ def _has_current_audio_carry_outer(forward: Any) -> bool:
+     } <= constants and "time_shift_sigma" in code.co_names
+ 
+ 
+-def _reject_latent_noise_masks(denoise_mask: Any, audio_denoise_mask: Any) -> None:
+-    """Refuse a latent noise mask instead of dropping it.
++def _reject_latent_noise_masks(denoise_mask: Any, audio_denoise_mask: Any,
++                               mask_row_values: Any = None) -> None:
++    """Refuse a latent noise mask this forward cannot plan, instead of dropping it.
+ 
+-    Comfy ff6c8a8 added the two mask parameters. The message below says what
+-    H3 does with a mask, in the block stream and the output head alike, and
+-    why this forward, which plans from the unmasked stream times, cannot
+-    honor it. The values are request-derived and identical on every rank
+-    before the first collective, so class P retires the sample lease consumed
+-    and the operator re-queues on the same fleet. The exception is a first-use
+-    gate ceremony, which proves the operator's own frozen latent: a refusal
+-    there aborts the ceremony and costs one Recycle, the contract
++    Comfy ff6c8a8 added the two mask parameters, and its ``_forward`` gives
++    masked rows their own timestep through ``mask_row_values``. This forward
++    plans the same rows from the same helper (``h3_mask_times``), so a mask
++    refuses only on a comfy that lacks it: there the plan would have to guess.
++    The values are request-derived and identical on every rank before the
++    first collective, so class P retires the sample lease consumed and the
++    operator re-queues on the same fleet. The exception is a first-use gate
++    ceremony, which proves the operator's own frozen latent: a refusal there
++    aborts the ceremony and costs one Recycle, the contract
+     docs/TROUBLESHOOTING.md #49 records for a mid-ceremony refusal.
+     """
++    if mask_row_values is not None:
++        return
+     for name, mask in (("denoise_mask", denoise_mask),
+                        ("audio_denoise_mask", audio_denoise_mask)):
+         if mask is None:
+@@ -124,11 +131,10 @@ def _reject_latent_noise_masks(denoise_mask: Any, audio_denoise_mask: Any) -> No
+         raise UnsupportedModelError(refusal(
+             RefusalClass.PHYSICS,
+             f"minimax_h3: this render carries a '{name}'. H3 runs masked rows at their "
+-            "own timestep: it shifts the stream's modulation row when the kept rows "
+-            "share one value, and turns that row into a per-token index tensor when "
+-            "they do not. This distributed forward plans its modulation rows from the "
+-            "unmasked stream times alone, so it would renoise the rows the mask "
+-            "preserves. Clear the latent mask, or take a true single-GPU reference "
++            "own timestep, and this ComfyUI's MiniMax H3 model has no "
++            "'mask_row_values', the helper that says which. Planning the rows without "
++            "it would renoise the rows the mask preserves. Update ComfyUI on every "
++            "host, clear the latent mask, or take a true single-GPU reference "
+             "(mode=local, gpus_per_host=1) (docs/MODELS.md).",
+         ))
+ 
+@@ -326,7 +332,11 @@ class MiniMaxH3Adapter(Adapter):
+             _reject_unsupported_h3_features(
+                 x, transformer_options, minimax_payload, kwargs, self.forward
+             )
+-            _reject_latent_noise_masks(denoise_mask, audio_denoise_mask)
++            import importlib
++
++            mask_row_values = getattr(
++                importlib.import_module("comfy.ldm.minimax.model"), "mask_row_values", None)
++            _reject_latent_noise_masks(denoise_mask, audio_denoise_mask, mask_row_values)
+ 
+             import comfy.ldm.common_dit
+             import comfy.model_prefetch
+@@ -366,8 +376,15 @@ class MiniMaxH3Adapter(Adapter):
+             sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+             t_v = float(1.0 - sigma_v)
+             t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
++            mask_times = None
++            if denoise_mask is not None or audio_denoise_mask is not None:
++                mask_times = h3_mask_times(
++                    mask_row_values, denoise_mask, audio_denoise_mask,
++                    latent_t, lat_h, lat_w, sigma_v, t_v, t_a,
++                    VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP)
+             unique_t, row_index, video_row, audio_row = h3_modulation_plan(
+-                layout, payload, t_v, t_a, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP)
++                layout, payload, t_v, t_a, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP,
++                mask_times=mask_times)
+ 
+             # Condition rows are fresh and unnoised each step. Per-condition CPU
+             # generator reseeding keeps this replicated span rank-invariant.
+@@ -456,6 +473,12 @@ class MiniMaxH3Adapter(Adapter):
+             # Gather and trim before absolute-coordinate head slicing. t_emb is
+             # indexed by modulation row rather than token and remains replicated.
+             h = sp_gather(h, seq_orig, dim=0)
++            # A masked stream's row is a per-token CPU tensor; the head
++            # indexes the device-resident modulation table with it.
++            if isinstance(video_row, torch.Tensor):
++                video_row = video_row.to(device)
++            if isinstance(audio_row, torch.Tensor):
++                audio_row = audio_row.to(device)
+             video_seg = next((a, b, video_row) for a, b, kind in layout.segments if kind == "video")
+             audio_seg = next((a, b, audio_row) for a, b, kind in layout.segments if kind == "audio")
+             # ComfyUI final-layer contract: full stream, one
+diff --git a/src/dgx_monarch/adapters/minimax_h3_packing.py b/src/dgx_monarch/adapters/minimax_h3_packing.py
+index 8544c28..3e575b2 100644
+--- a/src/dgx_monarch/adapters/minimax_h3_packing.py
++++ b/src/dgx_monarch/adapters/minimax_h3_packing.py
+@@ -74,6 +74,62 @@ def h3_timestep_embedding(model: Any, t_vals: torch.Tensor, dtype: torch.dtype)
+     return embedder(t_vals).to(dtype)
+ 
+ 
++def h3_mask_times(
++    mask_row_values: Any,
++    denoise_mask: Any,
++    audio_denoise_mask: Any,
++    latent_t: int,
++    lat_h: int,
++    lat_w: int,
++    sigma_v: torch.Tensor,
++    t_v: float,
++    t_a: float,
++    visual_cond_default: float,
++    audio_cond_default: float,
++) -> tuple[dict[str, float], torch.Tensor | None, torch.Tensor | None]:
++    """Times of the masked target rows, exactly as stock ``_forward`` derives them.
++
++    A mask value m puts a row at sigma = m * sigma_stream, so its model time is
++    ``1 - m * sigma``, clamped at the condition time for fully preserved rows.
++    When the kept rows share one value the stream's segment simply moves to
++    that time (first item, keyed by segment kind); otherwise the stream gets a
++    per-row time vector (second and third items, on the mask's device). The
++    arithmetic, dtypes, devices and pins are stock's line for line, so the
++    times, and the modulation rows built from them, are bit-identical.
++    """
++    seg_time: dict[str, float] = {}
++    video_rows_t = None
++    audio_rows_t = None
++    t_pin_v = max(t_v, visual_cond_default)
++    t_pin_a = max(t_a, audio_cond_default)
++    if denoise_mask is not None:
++        m = mask_row_values(denoise_mask[0, 0].to(torch.float32), latent_t, lat_h, lat_w)
++        if m is not None:
++            rows_t = (1.0 - m * sigma_v.to(m.device)).clamp(max=t_pin_v)
++            if rows_t.unique().numel() == 1:
++                seg_time["video"] = float(rows_t[0])
++            else:
++                video_rows_t = rows_t
++    if audio_denoise_mask is not None:
++        m = audio_denoise_mask[0, 0].to(torch.float32).reshape(-1)
++        if not bool((m >= 1.0 - 1e-3).all()):
++            sigma_a = 1.0 - t_a
++            rows_t = (1.0 - m * sigma_a).clamp(max=t_pin_a)
++            if rows_t.unique().numel() == 1:
++                seg_time["audio"] = float(rows_t[0])
++            else:
++                audio_rows_t = rows_t
++    return seg_time, video_rows_t, audio_rows_t
++
++
++def _rows_to_mod_index(rows_t: torch.Tensor, t_row: dict[float, int], tag: int) -> torch.Tensor:
++    """Per-row times -> per-row modulation indices, stock's ``rows_to_mod_index``."""
++    levels = rows_t.unique()
++    base = torch.tensor([t_row[v] * 3 + tag for v in levels.tolist()],
++                        dtype=torch.long, device=rows_t.device)
++    return base[torch.searchsorted(levels, rows_t)]
++
++
+ def h3_modulation_plan(
+     layout: Any,
+     payload: dict[str, Any],
+@@ -81,13 +137,20 @@ def h3_modulation_plan(
+     t_a: float,
+     visual_cond_default: float,
+     audio_cond_default: float,
+-) -> tuple[list[float], torch.Tensor, int, int]:
++    *,
++    mask_times: tuple[dict[str, float], torch.Tensor | None, torch.Tensor | None] | None = None,
++) -> tuple[list[float], torch.Tensor, Any, Any]:
+     """Return unique times, per-token modulation rows, and final-layer rows.
+ 
+     The int64 row vector shards with hidden states; ``row_runs`` reconstructs
+     local runs without rank-offset arithmetic. It stays on CPU because runs are
+     read as Python integers. Final-layer rows omit ``* 3`` because that adaLN
+     projection has one modality.
++
++    ``mask_times`` is ``h3_mask_times``' answer for a latent noise mask. A
++    stream it moves keeps one row; a stream it gives per-row times gets a
++    per-token row in both the block plan and the final layer (a CPU int64
++    tensor in place of the int), as stock's masked forward does.
+     """
+     vis_aug = float(payload.get("visual_cond_noise_aug", visual_cond_default))
+     aud_aug = float(payload.get("audio_cond_noise_aug", audio_cond_default))
+@@ -98,6 +161,12 @@ def h3_modulation_plan(
+     seg_time = {"text": t_v, "video": t_v, "audio": t_a,
+                 "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
+                 "cond_audio": max(t_a, aud_aug), "ref_audio": max(t_a, aud_aug)}
++    seg_override, video_rows_t, audio_rows_t = mask_times or ({}, None, None)
++    seg_time.update(seg_override)
++    if video_rows_t is not None:
++        video_rows_t = video_rows_t.to("cpu")
++    if audio_rows_t is not None:
++        audio_rows_t = audio_rows_t.to("cpu")
+     seg_modality = H3_SEG_MODALITY
+     present = {kind for _, _, kind in layout.segments}
+     unknown = sorted(present - seg_time.keys())
+@@ -112,8 +181,11 @@ def h3_modulation_plan(
+             "adapter has not vetted for sharding. Report the workflow, or take a true "
+             "single-GPU reference (mode=local, gpus_per_host=1) (docs/MODELS.md).",
+         ))
+-    unique_t = sorted({t_v, t_a} | {seg_time[kind] for kind in present})
++    unique_t = sorted({t_v, t_a} | {seg_time[kind] for kind in present}
++                      | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
++                      | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
+     t_row = {value: index for index, value in enumerate(unique_t)}
++    per_row = {"video": video_rows_t, "audio": audio_rows_t}
+ 
+     tags = payload.get("text_token_tags")
+     if tags is not None:
+@@ -124,9 +196,28 @@ def h3_modulation_plan(
+         if kind == "text" and tags is not None:
+             # Presentation prompts mark vision-pad positions with the video tag.
+             rows[start:stop] = tags[: stop - start] + base_row
++        elif per_row.get(kind) is not None:
++            rows_t = per_row[kind]
++            if int(rows_t.numel()) != stop - start:
++                # Request-derived and identical on every rank; stock would
++                # fail to broadcast here too, so refuse rather than guess.
++                raise UnsupportedModelError(refusal(
++                    RefusalClass.PHYSICS,
++                    f"minimax_h3: the '{kind}' noise mask covers {int(rows_t.numel())} rows "
++                    f"where the packed stream has {stop - start}. Rebuild the mask at the "
++                    "latent's size, or take a true single-GPU reference (mode=local, "
++                    "gpus_per_host=1) (docs/MODELS.md).",
++                ))
++            rows[start:stop] = _rows_to_mod_index(rows_t, t_row, seg_modality[kind])
+         else:
+             rows[start:stop] = base_row + seg_modality[kind]
+-    return unique_t, rows, t_row[seg_time["video"]], t_row[seg_time["audio"]]
++
++    def final_row(kind):
++        if per_row[kind] is not None:
++            return _rows_to_mod_index(per_row[kind], t_row, 0) // 3
++        return t_row[seg_time[kind]]
++
++    return unique_t, rows, final_row("video"), final_row("audio")
+ 
+ 
+ def pad_row_index(rows: torch.Tensor, padded_len: int) -> torch.Tensor:
+diff --git a/tests/test_minimax_h3.py b/tests/test_minimax_h3.py
+index fad8a45..5dbe875 100644
+--- a/tests/test_minimax_h3.py
++++ b/tests/test_minimax_h3.py
+@@ -677,12 +677,23 @@ def test_forward_refuses_an_attention_mask(name):
+                        **{name: torch.ones(1, 4)})
+ 
+ 
++def _minimax_model_stub(monkeypatch, **attrs):
++    """Stand in for comfy.ldm.minimax.model, with or without mask_row_values."""
++    import types
++
++    stub = types.ModuleType("comfy.ldm.minimax.model")
++    for key, value in attrs.items():
++        setattr(stub, key, value)
++    monkeypatch.setitem(sys.modules, "comfy.ldm.minimax.model", stub)
++    return stub
++
++
+ @pytest.mark.parametrize("name", ["denoise_mask", "audio_denoise_mask"])
+-def test_forward_refuses_a_latent_noise_mask(name):
+-    # Comfy ff6c8a8 answers a mask by giving masked rows their own timestep,
+-    # which makes the modulation row a per-token index tensor. This forward
+-    # carries one row per packed segment, so a dropped mask would renoise the
+-    # rows the operator preserved.
++def test_forward_refuses_a_latent_noise_mask_without_mask_row_values(name, monkeypatch):
++    # Comfy ff6c8a8 answers a mask by giving masked rows their own timestep
++    # through mask_row_values. On a comfy without it the plan would have to
++    # guess, and a guess renoises the rows the operator preserved.
++    _minimax_model_stub(monkeypatch)
+     model = _bound_forward()
+     with pytest.raises(UnsupportedModelError, match=name) as caught:
+         model._forward(_av_latents(), torch.zeros(1), torch.zeros(1, 4, 8), {},
+@@ -697,6 +708,23 @@ def test_forward_refuses_a_latent_noise_mask(name):
+     assert "mode=local" in str(caught.value)
+ 
+ 
++@pytest.mark.parametrize("name", ["denoise_mask", "audio_denoise_mask"])
++def test_forward_plans_a_latent_noise_mask(name, monkeypatch):
++    # With mask_row_values the forward plans masked rows as stock does
++    # (h3_mask_times), so a mask is not a refusal.
++    _minimax_model_stub(monkeypatch, mask_row_values=lambda *a: None)
++    model = _bound_forward()
++    try:
++        model._forward(_av_latents(), torch.zeros(1), torch.zeros(1, 4, 8), {},
++                       minimax_payload={"seed": 0, "audio_scale": 4.0},
++                       **{name: torch.ones(1, 1, 1, 4, 4)})
++    except UnsupportedModelError as exc:
++        pytest.fail(f"a {name} must be planned, not refused: {exc}")
++    except Exception:
++        # Anything else is the comfy runtime this CPU-only test does not have.
++        pass
++
++
+ @pytest.mark.parametrize("name", ["denoise_mask", "audio_denoise_mask"])
+ def test_forward_accepts_an_unset_latent_noise_mask(name):
+     # Comfy before ff6c8a8 never sends these; from it on, every unmasked

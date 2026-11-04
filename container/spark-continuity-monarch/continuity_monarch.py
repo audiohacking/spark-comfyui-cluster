@@ -33,11 +33,13 @@ exactly as Continuity does on one card, when it cannot: a turbo lead-in, a
 sigma shift off the checkpoint's (dgx-monarch carries one SD3-style shift,
 H3's is a video/audio pair), a sound seam, a ControlNet guide, a model-patch
 accelerator, a LoRA with its audio dial down, or a second checkpoint or LoRA
-stack in the same strip (the mesh holds one). The face, refine, re-detail and
-seam-restore passes always sample here, with Continuity's own LoRA stack and
-patches, after the cluster has done the heavy pass. Every local decision is
-logged with its reason. LoRAs on the cluster are merged by dgx-monarch's
-loader rather than Continuity's own H3 stack.
+stack in the same strip (the mesh holds one). The face pass samples its crop
+on the cluster too when the crop uses the model the cluster already holds
+(face_route.py); detection, masks and the composite stay here. The refine,
+re-detail and seam-restore passes always sample here, with Continuity's own
+LoRA stack and patches, after the cluster has done the heavy pass. Every local
+decision is logged with its reason. LoRAs on the cluster are merged by
+dgx-monarch's loader rather than Continuity's own H3 stack.
 
 A cluster sampler carries Continuity's animated preview and a page-cache
 prefetch for the local passes' files: see monarch_preview.py.
@@ -55,6 +57,7 @@ import sys
 log = logging.getLogger("spark.continuity_monarch")
 
 from . import encode_reuse  # noqa: E402  (face pass reuses the pass's encodes)
+from . import face_route  # noqa: E402  (face pass sampled on the cluster)
 from . import monarch_preview  # noqa: E402  (driver-side preview glue)
 
 MONARCH = "monarch"
@@ -225,6 +228,14 @@ class Models:
         if self._key is None:
             self._key = key
         return key == self._key
+
+    def holds(self, key):
+        """Whether the cluster's model is `key`, without claiming it."""
+        return self._key is not None and key == self._key
+
+    def built(self):
+        """Whether a pass of this render samples on the cluster."""
+        return self._link is not None
 
     def of(self, checkpoint, loras, acceleration):
         if self._link is None:
@@ -418,9 +429,10 @@ def _wrap(cls, mods):
         spec = json.dumps({"preview": preview, "prefetch": prefetch}, sort_keys=True)
         return graph.node(monarch_preview.NODE_ID, model=model, spec=spec).out(0)
 
-    # The passes after the first sample a crop or a re-noised latent against a
-    # real model, with Continuity's own stack and patches: always on this
-    # Spark, after the cluster has done the heavy pass.
+    # The passes after the first sample a re-noised latent against a real
+    # model, with Continuity's own stack and patches: on this Spark, after the
+    # cluster has done the heavy pass. The face pass is the exception where
+    # the cluster holds its model (emit_face).
     def emit_refine(self, graph, links, segment, payload, compiled, weights,
                     seams, latent, sampling, acceleration, seed, run):
         if enabled(weights):
@@ -430,13 +442,61 @@ def _wrap(cls, mods):
                                    weights, seams, latent, sampling, acceleration,
                                    seed, run)
 
+    def face_cluster(self, links, payload, compiled, sampling, acceleration):
+        """(the cluster's model link, None) when the face pass's sampling call
+        can run on the model the cluster already holds, or (None, why).
+
+        `payload` and `compiled` are the face crop's own (Continuity compiles
+        the crop separately, and dropping keyframes can move it to the other
+        checkpoint), so the key compared is the crop's checkpoint and LoRA
+        stack as the workers would take them."""
+        if not face_route.enabled():
+            return None, "SPARK_FACE_ON_CLUSTER=0"
+        if not face_route.mask_capable():
+            return None, "this image's dgx-monarch cannot sample a masked H3 render"
+        if not getattr(rm, "FACE_NODE", None):
+            return None, "this Continuity's face node moved"
+        monarch = getattr(links, "monarch", None)
+        if monarch is None or not monarch.built():
+            return None, "the main pass did not sample on the cluster"
+        loras, why = cluster_loras(self, payload, compiled)
+        why = why or accel_blocker(acceleration)
+        if why is None and sampling.shifted():
+            why = (f"the sigma shift (video {sampling.shift_video}, audio "
+                   f"{sampling.shift_audio}) is off the checkpoint's")
+        if why is None and not monarch.holds(Models.key(compiled.checkpoint, loras)):
+            why = (f"the crop samples on the {compiled.checkpoint} checkpoint and "
+                   f"LoRA stack, and the cluster holds another")
+        if why is not None:
+            return None, why
+        return monarch.of(compiled.checkpoint, loras, acceleration), None
+
     def emit_face(self, graph, links, payload, compiled, face, written, weights,
                   sampling, acceleration, seed):
-        if enabled(weights):
-            log.info("Continuity: the face pass samples on this Spark")
-            weights = local(weights)
-        return orig["emit_face"](self, graph, links, payload, compiled, face,
-                                 written, weights, sampling, acceleration, seed)
+        if not enabled(weights):
+            return orig["emit_face"](self, graph, links, payload, compiled, face,
+                                     written, weights, sampling, acceleration, seed)
+        cluster, why = face_cluster(self, links, payload, compiled, sampling, acceleration)
+        weights = local(weights)
+        if cluster is None:
+            log.info("Continuity: the face pass samples on this Spark: %s", why)
+            return orig["emit_face"](self, graph, links, payload, compiled, face,
+                                     written, weights, sampling, acceleration, seed)
+        # Detection, crops, masks and the composite stay Continuity's, here;
+        # its one sampling call per window goes to the cluster (face_route).
+        # The local model stays wired for a fallback. The preview node also
+        # frees this Spark's idle models before the cluster samples.
+        preview = None
+        if rm.core.preview_available():
+            preview = monarch_preview.capture_preview_kwargs(
+                rm.core, weights, rm.declare.RULES.fps)
+        spec = json.dumps({"preview": preview, "prefetch": []}, sort_keys=True)
+        cluster = graph.node(monarch_preview.NODE_ID, model=cluster, spec=spec).out(0)
+        log.info("Continuity: the face pass samples on the cluster "
+                 "(on this Spark if the cluster cannot take it)")
+        with face_route.routed_face(graph, rm.FACE_NODE, cluster):
+            return orig["emit_face"](self, graph, links, payload, compiled, face,
+                                     written, weights, sampling, acceleration, seed)
 
     def emit_seam_restore(self, graph, links, frames, payload, compiled, denoise,
                           *args, **kwargs):
@@ -515,6 +575,21 @@ def _compatible(mods):
     return missing
 
 
+def _install_face_route(render_mod):
+    """Let the face node's sampling call reach the cluster. -> True when in place."""
+    import nodes
+
+    face = nodes.NODE_CLASS_MAPPINGS.get(getattr(render_mod, "FACE_NODE", None) or "")
+    if face is None:
+        log.info("Continuity: no face node registered; face passes sample on this Spark")
+        return False
+    try:
+        return face_route.wrap_face_node(face)
+    except Exception:  # noqa: BLE001 - an optimization; the face pass runs here without it
+        log.exception("Continuity: face pass routing not installed; it samples on this Spark")
+        return False
+
+
 def install():
     """Patch Continuity once; True when the cluster backend is in place."""
     global _installed
@@ -537,6 +612,7 @@ def install():
     if not getattr(mods["render"].H3, "_spark_monarch", False):
         _wrap(mods["render"].H3, mods)
     STATE["encode_reuse"] = encode_reuse.install(mods["render"])
+    STATE["face_on_cluster"] = _install_face_route(mods["render"])
     if not monarch_preview.wrap_sampler():
         log.info("Continuity: dgx-monarch's sampler is not registered yet; "
                  "its preview is added on the next prompt")

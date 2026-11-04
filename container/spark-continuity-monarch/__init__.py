@@ -1,9 +1,10 @@
 """spark-comfyui-cluster: ComfyUI-Continuity on the dgx-monarch cluster.
 
 Baked into the cluster image beside dgx-monarch (/opt/monarch-nodes), so it
-loads only where the cluster nodes do. Adds no nodes of its own; it gives
-Continuity's MiniMax H3 family a "monarch" sampling backend. See
-continuity_monarch.py for what that means and what it refuses.
+loads only where the cluster nodes do. It gives Continuity's MiniMax H3 family
+a "monarch" sampling backend; its two nodes exist only inside Continuity's
+expanded graph. See continuity_monarch.py for what that means and what it
+refuses.
 
 ComfyUI loads the image's custom-node roots after its own custom_nodes, so
 Continuity is normally imported already. Whatever is missing at load (Continuity,
@@ -15,11 +16,14 @@ import logging
 
 from . import continuity_monarch
 
+from . import face_route
 from . import monarch_preview
 
 # Built only inside Continuity's expanded graph (continuity_monarch.py).
-NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview}
-NODE_DISPLAY_NAME_MAPPINGS = {monarch_preview.NODE_ID: "Cluster preview (spark)"}
+NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview,
+                       face_route.NODE_ID: face_route.SparkMonarchFaceRoute}
+NODE_DISPLAY_NAME_MAPPINGS = {monarch_preview.NODE_ID: "Cluster preview (spark)",
+                              face_route.NODE_ID: "Cluster face pass route (spark)"}
 
 try:
     import server

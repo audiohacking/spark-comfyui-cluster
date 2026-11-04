@@ -476,13 +476,22 @@ USER comfy
 # streams step numbers only). Identical on every rank, like the rest of the
 # image. A MONARCH_REF it no longer applies to fails the build here, by name,
 # rather than shipping a cluster without previews.
-COPY --chown=comfy:0 container/monarch-preview-x0.patch /opt/spark/
+#
+# A second one lets the MiniMax H3 forward take a latent noise mask, which
+# upstream refuses: it plans the masked rows' timesteps exactly as ComfyUI's
+# own masked forward does (`mask_row_values`, `1 - m * sigma` clamped at the
+# condition time, per-token modulation rows where they differ), so Continuity's
+# face pass, a masked denoise, can sample on the cluster. Its tests are
+# upstream's, adjusted to the new contract.
+COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
  && git -C /opt/monarch-nodes/dgx-monarch checkout ${MONARCH_SHA} \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-preview-x0.patch \
       || { echo "monarch-preview-x0.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-h3-mask.patch \
+      || { echo "monarch-h3-mask.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
@@ -502,6 +511,7 @@ COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/continuity_monarch.py \
      container/spark-continuity-monarch/monarch_preview.py \
      container/spark-continuity-monarch/encode_reuse.py \
+     container/spark-continuity-monarch/face_route.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/
