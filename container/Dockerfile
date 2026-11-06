@@ -491,8 +491,17 @@ USER comfy
 # partner that had left, GPU spinning, until the NCCL timeout. The ranks now
 # agree with a 4-byte max all-reduce at each boundary, all of which every rank
 # reaches after the readiness exchange.
+#
+# A fourth registers each weight slab with CUDA (cudaHostRegister, mapped).
+# On unified memory a slab is host memory the GPU reads in place, and the
+# driver had never been told about it, so the Triton INT8 GEMM's launcher
+# refused every slab weight ("cannot be accessed from Triton") and each actor
+# fell back to CUTLASS for the rest of its life. Registered, the same bytes stay
+# at the same address and the Triton kernel takes them: bit-identical results,
+# the INT8 linears in about 40% of the time. The registration is released
+# before the mapping is unmapped.
 COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
-     container/monarch-cancel-agree.patch /opt/spark/
+     container/monarch-cancel-agree.patch container/monarch-slab-register.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -503,6 +512,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-h3-mask.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-cancel-agree.patch \
       || { echo "monarch-cancel-agree.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-slab-register.patch \
+      || { echo "monarch-slab-register.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \

@@ -1,0 +1,191 @@
+diff --git a/src/dgx_monarch/actor/slab_arena.py b/src/dgx_monarch/actor/slab_arena.py
+index b8ff3dd..53d464f 100644
+--- a/src/dgx_monarch/actor/slab_arena.py
++++ b/src/dgx_monarch/actor/slab_arena.py
+@@ -16,6 +16,51 @@ log = logging.getLogger("dgx-monarch")
+ 
+ _ALIGN = 256  # cuBLAS/vectorized-load friendly tensor alignment
+ 
++# cudaHostRegisterMapped. A slab is host memory that wrap_u8 labels CUDA, which
++# unified memory makes readable from the GPU. Kernels that ask the driver about
++# a pointer first (Triton's launcher does, so the INT8 GEMM option needs it)
++# refuse an address the driver has never seen. Registering the mapping makes the
++# driver know it; on this hardware the device address is the host address, so
++# every tensor already wrapped stays valid and its bytes do not move.
++_CUDA_HOST_REGISTER_MAPPED = 2
++_REGISTER_WARNED: set[str] = set()  # Process lifetime: one warning per distinct reason.
++
++
++def _cuda_register(base: int, capacity: int) -> bool:
++    """Register [base, base + capacity) with CUDA; False, with one warning, when it cannot."""
++    try:
++        import torch
++
++        if not torch.cuda.is_available():
++            return False
++        props = torch.cuda.get_device_properties(torch.cuda.current_device())
++        if not getattr(props, "is_integrated", False):
++            return False  # a discrete GPU never reads a slab in place
++        cudart = torch.cuda.cudart()
++        err = cudart.cudaHostRegister(base, capacity, _CUDA_HOST_REGISTER_MAPPED)
++        code = int(getattr(err, "value", err))
++        if code == 0:
++            return True
++        reason = f"cudaHostRegister returned {err}"
++    except Exception as exc:  # never fail a load over this
++        reason = f"cudaHostRegister raised {exc!r:.200}"
++    if reason not in _REGISTER_WARNED:
++        _REGISTER_WARNED.add(reason)
++        log.warning("slab arena: %s; pointer-checking kernels (the Triton INT8 GEMM) "
++                    "stay on their fallback for this slab", reason)
++    return False
++
++
++def _cuda_unregister(base: int) -> bool:
++    """Unregister a mapping _cuda_register registered; False when CUDA refuses."""
++    try:
++        import torch
++
++        err = torch.cuda.cudart().cudaHostUnregister(base)
++        return int(getattr(err, "value", err)) == 0
++    except Exception:
++        return False
++
+ 
+ @dataclass
+ class _OwnedDescriptor:
+@@ -193,6 +238,7 @@ class _Arena:
+         self.closed = False
+         self.close_uncertain = False
+         self.acquisition_uncertain = False
++        self.cuda_registered = False
+         self._provisional_poisoned_before: bool | None = None
+         self._handoff = handoff
+         if handoff is not None:
+@@ -210,6 +256,7 @@ class _Arena:
+                 raise RuntimeError("mmap returned no mapping")
+             # A persistent ctypes view would make mmap.close() raise BufferError.
+             self.base = ctypes.addressof(ctypes.c_char.from_buffer(self.mm))
++            self.cuda_registered = _cuda_register(self.base, capacity)
+         except BaseException as error:
+             # Preserve the construction exception. The retained owner/poison
+             # survives any ambiguous mapping or descriptor cleanup outcome.
+@@ -278,10 +325,24 @@ class _Arena:
+         if self.closed:
+             self.confirm_handoff()
+             return
++        # A registered range is released before its mapping goes: unmapping
++        # memory CUDA still holds registered is undefined. A refusal leaves the
++        # mapping in place, fail-closed like a still-referenced view below.
++        if self.cuda_registered:
++            if not _cuda_unregister(self.base):
++                raise RuntimeError(
++                    "slab arena: CUDA did not release the registered mapping; reset the "
++                    "Attached mesh if explicit unload cannot release it"
++                )
++            self.cuda_registered = False
+         try:
+             if self.mm is not None:
+                 self.mm.close()
+         except BufferError as exc:  # exported view: retry only after another unload
++            # The mapping stays alive, so put the registration back for the
++            # tensors that still read it.
++            if self.mm is not None and not self.mm.closed:
++                self.cuda_registered = _cuda_register(self.base, self.capacity)
+             log.warning(
+                 "slab arena %d: mapping still referenced at close; "
+                 "retaining ownership until retry or process recycle",
+diff --git a/tests/test_slab_arena_cuda_register.py b/tests/test_slab_arena_cuda_register.py
+new file mode 100644
+index 0000000..a1f4186
+--- /dev/null
++++ b/tests/test_slab_arena_cuda_register.py
+@@ -0,0 +1,88 @@
++"""A weight slab is registered with CUDA so pointer-checking kernels accept it.
++
++Runs on an integrated (unified-memory) CUDA device only, where wrap_u8 hands
++the GPU the slab's host mapping in place.
++"""
++import ctypes
++import sys
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or not getattr(torch.cuda.get_device_properties(0), "is_integrated", False),
++    reason="needs an integrated CUDA device")
++
++
++_CU_POINTER_ATTRIBUTE_DEVICE_POINTER = 3
++
++
++def _attribute_device_pointer(ptr):
++    cuda = ctypes.CDLL("libcuda.so.1")
++    out = ctypes.c_uint64(0)
++    rc = cuda.cuPointerGetAttribute(ctypes.byref(out),
++                                    ctypes.c_int(_CU_POINTER_ATTRIBUTE_DEVICE_POINTER),
++                                    ctypes.c_uint64(ptr))
++    return rc, out.value
++
++
++def test_arena_registers_and_releases():
++    from dgx_monarch.actor.slab_arena import _Arena
++
++    arena = _Arena("test-slab-register", 1 << 20)
++    try:
++        assert arena.cuda_registered
++        rc, dev = _attribute_device_pointer(arena.base)
++        assert rc == 0 and dev == arena.base  # the driver knows it, at the host address
++    finally:
++        arena.close()
++    assert arena.closed and not arena.cuda_registered
++
++
++def test_triton_gemm_reads_a_slab_weight_bit_exactly():
++    import comfy_kitchen  # noqa: F401
++    from dgx_monarch.actor.slab_arena import _Arena
++    from dgx_monarch.actor.slab_wrap import wrap_u8
++    from dgx_monarch.kernels import int8_gemm_triton as v
++
++    if v.kitchen_version() not in v.VALIDATED_KITCHEN:
++        pytest.skip("comfy-kitchen outside the Triton kernel's validated set")
++    backend = sys.modules[v.TARGET]
++    real = getattr(backend._C, "_real", backend._C)
++    gemm = v.build_triton_gemm()
++    M, N, K = 1024, 512, 768
++    arena = _Arena("test-slab-gemm", N * K + 4096)
++    try:
++        w = wrap_u8(arena.base, N * K, cuda=True).view(torch.int8).view(N, K)
++        torch.manual_seed(0)
++        w.copy_(torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda"))
++        x = torch.randint(-127, 127, (M, K), dtype=torch.int8, device="cuda")
++        xs = torch.rand(M, 1, device="cuda")
++        ws = torch.rand(N, 1, device="cuda")
++        bias = torch.empty(0, dtype=torch.bfloat16, device="cuda")
++        ref = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
++        real.cutlass_int8_dequant(*(t.__dlpack__(stream=-1) for t in (x, w, xs, ws, bias, ref)), 2, 0)
++        out = torch.empty_like(ref)
++        gemm(x, w, xs, ws, bias, out)  # raised "Pointer argument cannot be accessed" unregistered
++        torch.cuda.synchronize()
++        assert torch.equal(out, ref)
++        del w
++    finally:
++        arena.close()
++
++
++def test_still_referenced_mapping_keeps_its_registration():
++    from dgx_monarch.actor.slab_arena import _Arena
++
++    arena = _Arena("test-slab-held", 1 << 16)
++    view = memoryview(arena.mm)  # an exported buffer makes mmap.close() refuse
++    try:
++        with pytest.raises(RuntimeError):
++            arena.close()
++        assert not arena.closed
++        assert arena.cuda_registered  # put back for the tensors still reading it
++    finally:
++        view.release()
++        arena.close()
++    assert arena.closed and not arena.cuda_registered
