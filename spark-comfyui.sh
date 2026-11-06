@@ -2162,6 +2162,8 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     || CRUN_ARGS+=(-e "SPARK_MONARCH_ATTENTION=$SPARK_MONARCH_ATTENTION")
   [[ -z "${SPARK_ENCODE_REUSE:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_ENCODE_REUSE=$SPARK_ENCODE_REUSE")
+  [[ -z "${SPARK_VIDEO_REF_SIZE:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_VIDEO_REF_SIZE=$SPARK_VIDEO_REF_SIZE")
   [[ -z "${SPARK_FACE_ON_CLUSTER:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_FACE_ON_CLUSTER=$SPARK_FACE_ON_CLUSTER")
   if [[ "$role" == worker ]]; then

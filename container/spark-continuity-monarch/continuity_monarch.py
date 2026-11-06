@@ -172,20 +172,29 @@ def run_blocker(compiled, splits, sampling, anchors_anywhere):
 # ---- the mesh --------------------------------------------------------------
 
 
+# The cluster's kernel for a render whose attention is 'default'. SageAttention,
+# as the driver's own ComfyUI runs it (--use-sage-attention), so a pass costs
+# the same kind of attention on either side; on GB10 SAGE_AUTO dispatches to
+# the INT8-QK/FP8-PV kernel, about 1.8x the exact TORCH_FLASH at H3's lengths.
+# SPARK_MONARCH_ATTENTION=TORCH_FLASH keeps exact attention.
+DEFAULT_ATTENTION = "SAGE_AUTO"
+
+
 def attention_option(attention):
     """dgx-monarch's kernel for our setting, read off the installed class.
-    None leaves the Init node's own pick (exact TORCH_FLASH) for 'default', as
-    does a dgx-monarch with no sage kernel. SPARK_MONARCH_ATTENTION names one
-    of the Init node's kernels for every 'default' render instead (SAGE_AUTO
-    for quantized attention)."""
+    'default' takes SPARK_MONARCH_ATTENTION, else DEFAULT_ATTENTION; 'sage'
+    takes dgx-monarch's sage kernel. None leaves the Init node's own pick
+    (exact TORCH_FLASH), as when this dgx-monarch has no such kernel."""
     declared = (_require(INIT_NODE).INPUT_TYPES().get("optional") or {}).get("attention")
     options = [str(option) for option in (declared[0] if declared else [])]
-    forced = os.environ.get("SPARK_MONARCH_ATTENTION", "").strip()
-    if attention == "default" and forced:
-        if forced in options:
-            return forced
-        log.warning("SPARK_MONARCH_ATTENTION=%s is not one of dgx-monarch's kernels "
-                    "(%s); ignored", forced, ", ".join(options))
+    asked = os.environ.get("SPARK_MONARCH_ATTENTION", "").strip()
+    if attention == "default":
+        if (asked or DEFAULT_ATTENTION) in options:
+            return asked or DEFAULT_ATTENTION
+        if asked:
+            log.warning("SPARK_MONARCH_ATTENTION=%s is not one of dgx-monarch's kernels "
+                        "(%s); ignored", asked, ", ".join(options))
+        return None
     if attention != "sage":
         return None
     return next((option for option in options if "SAGE" in option.upper()), None)
@@ -575,6 +584,36 @@ def _compatible(mods):
     return missing
 
 
+_COMPILE = ".creator.compile"
+_REF_SIZES = ("match", "max")
+
+
+def _install_video_ref_size(prefix):
+    """The size a reference video encodes at when its blob names none. -> it.
+
+    Continuity's default is 'max' (core's 768-short-edge reference canvas).
+    'match' takes the generation's pixel area instead, down-only, so it never
+    costs more; a reference clip is about as many rows as the video it guides,
+    and every row rides through every step of both passes, so on the cluster
+    'match' is the default (SPARK_VIDEO_REF_SIZE=max keeps Continuity's).
+    Changed in compile.DEFAULT_REF_SIZE itself, in place: the compiler and
+    the editor's manifest both read that table, so the chip a reference shows
+    and the canvas it encodes at stay the same. A clip whose size was picked
+    keeps it."""
+    wanted = os.environ.get("SPARK_VIDEO_REF_SIZE", "").strip() or "match"
+    if wanted not in _REF_SIZES:
+        log.warning("SPARK_VIDEO_REF_SIZE=%s is not one of %s; using match",
+                    wanted, ", ".join(_REF_SIZES))
+        wanted = "match"
+    table = getattr(sys.modules.get(prefix + _COMPILE), "DEFAULT_REF_SIZE", None)
+    if not isinstance(table, dict) or "video" not in table:
+        log.info("Continuity: no per-kind reference size table; reference videos "
+                 "keep its own default")
+        return None
+    table["video"] = wanted
+    return wanted
+
+
 def _install_face_route(render_mod):
     """Let the face node's sampling call reach the cluster. -> True when in place."""
     import nodes
@@ -613,6 +652,8 @@ def install():
         _wrap(mods["render"].H3, mods)
     STATE["encode_reuse"] = encode_reuse.install(mods["render"])
     STATE["face_on_cluster"] = _install_face_route(mods["render"])
+    STATE["video_ref_size"] = _install_video_ref_size(
+        mods["raylight"].__name__[: -len(_RAYLIGHT)])
     if not monarch_preview.wrap_sampler():
         log.info("Continuity: dgx-monarch's sampler is not registered yet; "
                  "its preview is added on the next prompt")
