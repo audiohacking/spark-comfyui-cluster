@@ -1,0 +1,165 @@
+diff --git a/src/dgx_monarch/adapters/base.py b/src/dgx_monarch/adapters/base.py
+index bcbbebf..c6a6fbd 100644
+--- a/src/dgx_monarch/adapters/base.py
++++ b/src/dgx_monarch/adapters/base.py
+@@ -62,6 +62,39 @@ def sp_world() -> int:
+     return get_sequence_parallel_world_size()
+ 
+ 
++def ulysses_world() -> int:
++    """The Ulysses degree of this process's sequence group (1 when unset)."""
++    try:
++        from xfuser.core.distributed import get_ulysses_parallel_world_size
++
++        return int(get_ulysses_parallel_world_size())
++    except Exception:  # noqa: BLE001  # no USP group: nothing is split by head
++        return 1
++
++
++def pad_heads(tensors, degree: int):
++    """Grow the head axis (dim 2 of `(B, L, H, D)`) to a multiple of `degree`.
++
++    Ulysses hands every rank an equal share of the heads, so a degree that does
++    not divide the head count (56 heads on 3 ranks) needs extra heads. They are
++    copies of the leading real heads, never zeros: a quantizing kernel scales
++    each head block by its own maximum, and an all-zero block would divide by
++    zero. Heads are independent, so the real heads' outputs are unchanged and
++    the copies are sliced off after the reverse all-to-all.
++    """
++    tensors = tuple(tensors)
++    heads = tensors[0].shape[2]
++    extra = -heads % degree if degree > 1 else 0
++    if not extra:
++        return tensors, 0
++    grown = []
++    for t in tensors:
++        reps = -(-extra // t.shape[2])
++        fill = t.repeat(1, 1, reps, 1)[:, :, :extra] if reps > 1 else t[:, :, :extra]
++        grown.append(torch.cat([t, fill], dim=2))
++    return tuple(grown), extra
++
++
+ def sp_rank() -> int:
+     from xfuser.core.distributed import get_sequence_parallel_rank
+ 
+@@ -294,6 +327,8 @@ def _make_usp_attention_callable(
+         if qkv_validator is not None:
+             qkv_validator(q_l, k_l, v_l)
+ 
++        (q_l, k_l, v_l), extra_heads = pad_heads((q_l, k_l, v_l), ulysses_world())
++
+         padded = bool(drop_rows) or bool(kv_drop_rows)
+         ring_world = 0
+         if padded or query_bias_groups or sequence_order is not None:
+@@ -321,6 +356,8 @@ def _make_usp_attention_callable(
+ 
+         if not isinstance(out, torch.Tensor):
+             raise UnsupportedModelError("USP attention returned a non-tensor output")
++        if extra_heads:
++            out = out[:, :, :h]
+         if skip_output_reshape:
+             return out.transpose(1, 2)
+         return out.reshape(b, -1, h * d)
+diff --git a/src/dgx_monarch/adapters/flux3_packing.py b/src/dgx_monarch/adapters/flux3_packing.py
+index 29fe4a7..ed74df6 100644
+--- a/src/dgx_monarch/adapters/flux3_packing.py
++++ b/src/dgx_monarch/adapters/flux3_packing.py
+@@ -153,19 +153,8 @@ def ulysses_degree() -> int:
+ 
+ def refuse_indivisible_heads(heads: int, degree: int, *, family: str = "flux3",
+                              divisors: str = "2, 4 or 8 for the 24-head FLUX.3 Klein files") -> None:
+-    """Refuse a Ulysses degree that does not divide the attention heads.
+-
+-    Ulysses hands each rank whole heads. Every shipped FLUX.3 Klein file has
+-    24, which degrees 2, 4 and 8 divide; ring has no head constraint.
+-    MOSS-Image passes its own ``family`` and ``divisors`` (adapters/moss_image.py).
+-    """
+-    if degree > 1 and heads % degree:
+-        raise UnsupportedModelError(refusal(
+-            RefusalClass.PHYSICS,
+-            f"{family}: this checkpoint has {heads} attention heads, which the Ulysses "
+-            f"degree {degree} does not divide, and Ulysses hands each rank whole heads. "
+-            f"Use a Ulysses degree that divides the head count ({divisors}), a ring "
+-            "topology, or topology 'single' (mode=local with gpus_per_host=1) "
+-            "(docs/MODELS.md).",
+-        ))
+-
++    """Any Ulysses degree serves: the USP attention wrapper grows the head
++    axis to a multiple of the degree with copies of real heads and drops them
++    after the reverse all-to-all (adapters/base.py, pad_heads). Kept as a
++    call site so the adapters read as before."""
++    return None
+diff --git a/src/dgx_monarch/adapters/omnigen2.py b/src/dgx_monarch/adapters/omnigen2.py
+index a4da052..008fc7e 100644
+--- a/src/dgx_monarch/adapters/omnigen2.py
++++ b/src/dgx_monarch/adapters/omnigen2.py
+@@ -34,14 +34,11 @@ _KV_HEADS = 7
+ 
+ 
+ def _assert_ring_only_topology(ulysses_degree: int) -> None:
+-    """Refuse Ulysses degrees that cannot divide the expanded query heads."""
+-    if ulysses_degree > 1 and _Q_HEADS % ulysses_degree != 0:
+-        raise UnsupportedModelError(
+-            f"omnigen2 has {_Q_HEADS} attention heads ({_KV_HEADS} kv), not divisible by the "
+-            f"requested ulysses degree {ulysses_degree}: the Ulysses all-to-all gives each rank "
+-            "an equal share of the heads. Use a ring topology (auto picks ring2), which shards "
+-            "the sequence and keeps every head whole (docs/MODELS.md)."
+-        )
++    """Any Ulysses degree serves: the USP attention wrapper grows the head
++    axis to a multiple of the degree with copies of real heads and drops them
++    after the reverse all-to-all (adapters/base.py, pad_heads). Kept as a
++    call site so the adapters read as before."""
++    return None
+ 
+ 
+ def _assert_uniform_batch(seq_lengths) -> None:
+diff --git a/src/dgx_monarch/adapters/zimage.py b/src/dgx_monarch/adapters/zimage.py
+index 089f154..4d881b2 100644
+--- a/src/dgx_monarch/adapters/zimage.py
++++ b/src/dgx_monarch/adapters/zimage.py
+@@ -59,18 +59,11 @@ def _ulysses_degree() -> int:
+ 
+ 
+ def _assert_ulysses_divides_heads(n_heads: int, ulysses_degree: int) -> None:
+-    """Require the Ulysses degree to divide the attention-head count.
+-
+-    Z-Image has 30 heads, so uly2 is valid and uly4 is not. Ring has no head
+-    constraint (docs/MODELS.md, How a family qualifies).
+-    """
+-    if ulysses_degree > 1 and n_heads % ulysses_degree != 0:
+-        raise UnsupportedModelError(
+-            f"zimage: {n_heads} attention heads are not divisible by the Ulysses degree "
+-            f"{ulysses_degree} (Ulysses splits the heads across ranks). Z-Image has 30 heads: "
+-            "uly2 works (30 % 2 == 0) but uly4 does not. Use a ring topology (no head "
+-            "constraint) or uly2; a two-rank world is unaffected."
+-        )
++    """Any Ulysses degree serves: the USP attention wrapper grows the head
++    axis to a multiple of the degree with copies of real heads and drops them
++    after the reverse all-to-all (adapters/base.py, pad_heads). Kept as a
++    call site so the adapters read as before."""
++    return None
+ 
+ 
+ def _assert_concat_divisible(concat_len: int, sp: int) -> None:
+diff --git a/src/dgx_monarch/topology.py b/src/dgx_monarch/topology.py
+index f816941..6b62460 100644
+--- a/src/dgx_monarch/topology.py
++++ b/src/dgx_monarch/topology.py
+@@ -282,6 +282,17 @@ def choose_auto_topology(
+         topo_kwargs["fsdp"] = True
+     topo = Topology(world=world, **topo_kwargs)  # type: ignore[arg-type]
+ 
++    if world > 2 and batch_size == 1 and world > topo.model_parallel:
++        # Every table row is a two-rank layout. A batch-1 render on a larger
++        # world spreads over all of it with Ulysses: the USP attention wrapper
++        # pads the heads to a multiple of the degree (adapters/base.py,
++        # pad_heads) and the pure-Ulysses path drops sequence pad rows exactly,
++        # so no head count or packed length limits the degree. World 2 keeps
++        # the measured rows untouched.
++        topo = Topology(world=world, ulysses=world, fsdp=topo.fsdp)
++        note = (f"{note}; ulysses{world} spreads the batch-1 render over all "
++                f"{world} ranks (heads padded to a multiple of {world} where needed)")
++
+     if world % topo.model_parallel != 0:
+         # Odd worlds cannot tile degree-2 rows. Pure Ring avoids head constraints
+         # and keeps data parallel at one for batch-1 renders.

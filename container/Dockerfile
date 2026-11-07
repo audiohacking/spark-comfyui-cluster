@@ -500,8 +500,18 @@ USER comfy
 # at the same address and the Triton kernel takes them: bit-identical results,
 # the INT8 linears in about 40% of the time. The registration is released
 # before the mapping is unmapped.
+# A fifth lets a render spread over any number of Sparks. Ulysses hands every
+# rank an equal share of the attention heads, so a degree that does not divide
+# a model's head count (56 heads on 3 Sparks) was refused, and auto fell back to
+# ring, which H3 and other maskless families refuse whenever the packed length
+# needs padding. The USP attention wrapper now grows the head axis to a multiple
+# of the degree with copies of real heads and drops them after the reverse
+# all-to-all (exact: heads are independent), the per-family head refusals go,
+# and auto spreads a batch-1 render over the whole world with Ulysses above two
+# ranks. World-2 decisions and kernels are unchanged.
 COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
-     container/monarch-cancel-agree.patch container/monarch-slab-register.patch /opt/spark/
+     container/monarch-cancel-agree.patch container/monarch-slab-register.patch \
+     container/monarch-ulysses-any-world.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -514,6 +524,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-cancel-agree.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-slab-register.patch \
       || { echo "monarch-slab-register.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-ulysses-any-world.patch \
+      || { echo "monarch-ulysses-any-world.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \

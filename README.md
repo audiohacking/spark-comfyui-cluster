@@ -549,6 +549,85 @@ This finds the `[[hosts]]` row whose IP is local, starts the worker container, a
 
 dgx-monarch's example workflows appear under **Workflow → Browse Templates**. For MiniMax H3, start from `dgx-monarch-minimax-h3-t2va` (or `-mp4`, `-guide`). They replace the stock loader and sampler with `DGXMonarchUNETLoader` and `DGXMonarchKSampler`, behind a `DGXMonarchInit` node that attaches the fleet. Upstream's `example_workflows/artifacts.toml` lists the model files they expect. The first render attaches every worker and loads the model on each rank, so it takes longer than the ones after it. For Continuity there's nothing to change: see [Continuity on the cluster](#continuity-on-the-cluster).
 
+### Adding a Spark to a running cluster
+
+A render spreads over every Spark in `spark-cluster.toml`, whatever their number. With `topology = auto` (what Continuity uses), two Sparks split it in two as before, and three or more split it across all of them. A model whose attention-head count the number of Sparks doesn't divide (MiniMax H3 has 56 heads, so 3, 5 or 6 Sparks) still runs: a few attention heads are computed twice and the duplicates dropped, which leaves the output unchanged and costs about 2% more attention work on 3 Sparks.
+
+The new Spark is `192.0.2.12` below. Run the commands on the driver unless a step says otherwise.
+
+**1. Fabric.** Connect the new Spark to the fabric. Every Spark must reach every other one, because each render exchanges data between all pairs: on a switch that means one more port in the same subnet. Then check from the driver and from each worker:
+
+```bash
+ping -c2 192.0.2.12
+```
+
+Add the new address to the fabric's source restrictions ([Before you start](#before-you-start), item 5).
+
+**2. Stand-alone first** (on the new Spark). Clone this repo at the same path as on the others, copy the same `spark-comfyui.env` and `spark-mounts.conf`, then:
+
+```bash
+./spark-comfyui.sh install
+./spark-comfyui.sh doctor            # every line PASS
+```
+
+**3. The same content.** Install the same custom nodes as on the other Sparks (the same `comfyui-nodes.list`, plus `recipe install`). After step 5 the models can be checked and copied from the driver:
+
+```bash
+./spark-comfyui.sh cluster models list --missing
+./spark-comfyui.sh cluster models sync '*'
+```
+
+**4. ssh.** The cluster key on the new Spark, the new address as a known host for that key, and your own passwordless ssh to it:
+
+```bash
+ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub you@192.0.2.12   # or the key ssh_key names
+ssh-keyscan -H 192.0.2.12 >> ~/.ssh/spark-comfyui-cluster/known_hosts
+ssh 192.0.2.12 docker info >/dev/null && echo ok
+```
+
+**5. The config.** Add a `[[hosts]]` block for the new Spark at the end of `spark-cluster.toml` (the driver stays first), and copy the file to every Spark:
+
+```toml
+[[hosts]]
+name = "192.0.2.12"
+address = "tcp://192.0.2.12:26600"
+gpus = 1
+ssh_user = "you"
+```
+
+```bash
+for h in 192.0.2.11 192.0.2.12; do scp -p spark-cluster.toml "$h":~/Documents/ComfyUI/spark-comfyui-cluster/; done
+```
+
+If the new Spark's NIC names differ from the others', the `[fabric.generic-roce]` names must still match on every Spark: dgx-monarch applies one set to all of them.
+
+**6. The image.** Send the driver's exact image to the new Spark. This also starts its worker:
+
+```bash
+./spark-comfyui.sh cluster push 192.0.2.12
+```
+
+**7. Restart the whole cluster**, so the driver and every worker agree on the new size:
+
+```bash
+./spark-comfyui.sh stop
+./spark-comfyui.sh cluster worker --restart                                        # on the driver
+ssh 192.0.2.11 ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart
+ssh 192.0.2.12 ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart
+./spark-comfyui.sh service
+```
+
+**8. Check:**
+
+```bash
+./spark-comfyui.sh cluster status       # every host: worker healthy, SAME image ID and monarch commit
+./spark-comfyui.sh cluster dgxm doctor  # all green
+```
+
+The first render after the change runs dgx-monarch's first-use identity check again, because the split is new, so it takes longer than the ones after it. During sampling, `./spark-comfyui.sh cluster dgxm top` shows GPU load on every host.
+
+To take a Spark out again, delete its `[[hosts]]` block on every Spark, run `cluster worker --disable` on it, and restart the rest as in step 7.
+
 ### Quick test: one Spark, then two
 
 A first run of the fork on two Sparks, A (the driver) and B, either of which may also have a stock install running. Phase 1 proves each Spark on its own. Phase 2 clusters them. Commands run in the checkout directory unless a step says otherwise.
