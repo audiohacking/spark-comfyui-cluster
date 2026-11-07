@@ -509,9 +509,14 @@ USER comfy
 # all-to-all (exact: heads are independent), the per-family head refusals go,
 # and auto spreads a batch-1 render over the whole world with Ulysses above two
 # ranks. World-2 decisions and kernels are unchanged.
+# monarch-vae-encode-split.patch: the worker_vae_decode knob also splits
+# MiniMax H3 video encodes. The encoder runs independent 17-frame clips, so the
+# Workers encode some clips of the stock encode_temporal loop, and the driver
+# takes a clip back only for the exact pixels it planned (byte-identical;
+# DGXM_VAE_ENCODE=off keeps encodes on the driver).
 COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
      container/monarch-cancel-agree.patch container/monarch-slab-register.patch \
-     container/monarch-ulysses-any-world.patch /opt/spark/
+     container/monarch-ulysses-any-world.patch container/monarch-vae-encode-split.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -526,6 +531,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-slab-register.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-ulysses-any-world.patch \
       || { echo "monarch-ulysses-any-world.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-vae-encode-split.patch \
+      || { echo "monarch-vae-encode-split.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
@@ -547,6 +554,7 @@ COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/encode_reuse.py \
      container/spark-continuity-monarch/face_route.py \
      container/spark-continuity-monarch/te_cache.py \
+     container/spark-continuity-monarch/vae_cache.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/

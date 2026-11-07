@@ -19,8 +19,10 @@ from . import continuity_monarch
 from . import face_route
 from . import monarch_preview
 from . import te_cache
+from . import vae_cache
 
 te_cache.install()  # every workflow's text encodes, Continuity or not
+vae_cache.install()  # every workflow's VAE encodes, Continuity or not
 
 # Built only inside Continuity's expanded graph (continuity_monarch.py).
 NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview,
@@ -35,7 +37,8 @@ try:
     @server.PromptServer.instance.routes.get("/spark/continuity-monarch")
     async def _status(request):
         return web.json_response({**continuity_monarch.status(),
-                                  "te_cache": te_cache.status()})
+                                  "te_cache": te_cache.status(),
+                                  "vae_cache": vae_cache.status()})
 except Exception:
     logging.getLogger("spark.continuity_monarch").exception(
         "Continuity cluster backend: no status route")
@@ -46,6 +49,7 @@ def _settle():
     pack can load before dgx-monarch: its sampler is then not registered and
     its package not importable yet. Each step is idempotent."""
     monarch_preview.quiet_notices()
+    vae_cache.install()  # back on top if dgx-monarch's encode split wrapped it since
     installed = continuity_monarch.install()
     if installed:
         monarch_preview.wrap_sampler()

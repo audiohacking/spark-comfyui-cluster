@@ -1,0 +1,540 @@
+diff --git a/src/dgx_monarch/actor/vae_decode.py b/src/dgx_monarch/actor/vae_decode.py
+index e44707d..1f9685a 100644
+--- a/src/dgx_monarch/actor/vae_decode.py
++++ b/src/dgx_monarch/actor/vae_decode.py
+@@ -38,7 +38,7 @@ from ..vae_decode_plan import pretouched_cpu
+ log = get_logger(__name__)
+ 
+ SCHEMA = 1
+-KINDS = ("multidim", "h3_chunk")
++KINDS = ("multidim", "h3_chunk", "h3_encode")  # h3_encode: spark-comfyui-cluster patch
+ _FOLDERS = ("vae", "vae_approx")
+ _GIB = float(1 << 30)
+ 
+@@ -204,7 +204,11 @@ def _decode(worker: Any, held: ResidentVae, spec: UnitRequest) -> Any:
+ 
+     vae = held.vae
+     fsm = vae.first_stage_model
+-    _require_room(worker, int(vae.memory_used_decode(tuple(spec.input.shape), vae.vae_dtype)), "decode the unit")
++    if spec.kind == "h3_encode":
++        # The stock price VAE.encode puts on the whole [B, C, T, H, W] input.
++        _require_room(worker, int(vae.memory_used_encode(tuple(spec.input.shape), vae.vae_dtype)), "encode the unit")
++    else:
++        _require_room(worker, int(vae.memory_used_decode(tuple(spec.input.shape), vae.vae_dtype)), "decode the unit")
+     latent = spec.input.to(vae.device)
+     import comfy.model_management as mm
+ 
+@@ -224,6 +228,11 @@ def _run_unit(fsm: Any, spec: UnitRequest, latent: Any) -> Any:
+         # the driver already applied the first cast.
+         out = fsm.decode(latent)
+         return out if spec.output_dtype is None else out.to(dtype=spec.output_dtype)
++    if spec.kind == "h3_encode":
++        # What the stock encode_temporal does with one clip once it is on the device.
++        if getattr(fsm, "encoder", None) is None:
++            raise Decline("this host's VAE was built without its encoder")
++        return fsm._adaptive_encode(fsm._normalize_pixels(latent))
+     return fsm._adaptive_decode(latent)
+ 
+ 
+diff --git a/src/dgx_monarch/vae_decode_families.py b/src/dgx_monarch/vae_decode_families.py
+index 2247803..45331cb 100644
+--- a/src/dgx_monarch/vae_decode_families.py
++++ b/src/dgx_monarch/vae_decode_families.py
+@@ -25,9 +25,14 @@ from dataclasses import dataclass
+ from typing import Any
+ 
+ H3_CHUNK = "h3_chunk"
++# One MiniMax H3 encode clip (``MiniMaxH3VideoVAE.encode_temporal``): each
++# clip_length-frame clip encodes on its own, with no state carried between
++# clips, so the unit is one clip (spark-comfyui-cluster patch).
++H3_ENCODE = "h3_encode"
+ MULTIDIM = "multidim"
+ DECODE = "decode"  # VAEDecode
+ DECODE_TILED = "decode_tiled"  # VAEDecodeTiled
++ENCODE = "encode"  # comfy.sd.VAE.encode: VAE Encode and every node that encodes through it
+ # Stills at or under this many output pixels decode in about a second on
+ # one GB10; a split would add a transfer and buy nothing (issue #93).
+ STILL_SPLIT_MIN_PIXELS = 1_200_000
+diff --git a/src/dgx_monarch/vae_decode_plan.py b/src/dgx_monarch/vae_decode_plan.py
+index 1c22afb..c2cf868 100644
+--- a/src/dgx_monarch/vae_decode_plan.py
++++ b/src/dgx_monarch/vae_decode_plan.py
+@@ -266,3 +266,68 @@ class H3Replay(_Replay):
+             # The stock canvas lives on the decode device; so must this one.
+             return value.to(device=z.device)
+         return self._local_result(self._original(z, frames))
++
++
++def h3_encode_plan(fsm: Any, x: Any) -> list[Any]:
++    """Each clip ``MiniMaxH3VideoVAE.encode_temporal`` will normalize and hand ``_adaptive_encode``.
++
++    ``x`` is the stock loop's own input (``[B, C, T, H, W]`` in the VAE's
++    dtype, on the CPU under ComfyUI's chunked I/O). The clips are cut and the
++    last one padded with copies of its final frame, as the loop does; padding
++    is a copy, so it gives the same values on the CPU as on the GPU. The replay
++    checks each clip the loop really normalizes against these, so a change
++    upstream makes the encode run here, never a wrong latent.
++    """
++    import math
++
++    import torch
++
++    length = int(fsm.clip_length)
++    clips = []
++    for index in range(math.ceil(int(x.shape[2]) / length)):
++        clip = x[:, :, index * length:(index + 1) * length, :, :]
++        if clip.shape[2] < length:
++            pad = clip[:, :, -1:].repeat(1, 1, length - clip.shape[2], 1, 1)
++            clip = torch.cat([clip, pad], dim=2)
++        clips.append(clip)
++    return clips
++
++
++class H3EncodeReplay(_Replay):
++    """Stands in for ``MiniMaxH3VideoVAE._adaptive_encode`` during the stock ``encode_temporal``.
++
++    The stock loop hands it a normalized clip on the encode device. Unit k
++    matches only when that tensor equals the planned raw clip k normalized by
++    the model's own ``_normalize_pixels`` on the same device, byte for byte; a
++    Worker computes exactly that from the raw clip it was sent. Every clip has
++    the same shape (the last one is padded), so each remote result must equal
++    the driver's own unit 0 result in dtype and in every dimension.
++    """
++
++    def __init__(self, board: UnitBoard, plan: list[Any], fsm: Any, *, max_wait_s: float,
++                 check_interrupt: Callable[[], None] | None = None) -> None:
++        super().__init__(board, len(plan), max_wait_s=max_wait_s, check_interrupt=check_interrupt)
++        self._plan = plan
++        self._original = functools.partial(type(fsm)._adaptive_encode, fsm)
++        self._normalize = functools.partial(type(fsm)._normalize_pixels, fsm)
++        self._shape: tuple[int, ...] | None = None
++
++    def __call__(self, x: Any) -> Any:
++        import torch
++
++        def matches(unit: int) -> bool:
++            planned = self._plan[unit]
++            if x.shape != planned.shape or x.dtype != planned.dtype:
++                return False
++            return bool(torch.equal(x, self._normalize(planned.to(x.device))))
++
++        unit, remote, value = self._turn(matches)
++        if remote and self._usable(unit, value):
++            if self._shape is None or tuple(value.shape) == self._shape:
++                return value.to(device=x.device)
++            self._board.reject(unit, f"unit {unit} came back with shape {tuple(value.shape)} where "
++                                     f"the stock encode gives {self._shape}")
++        out = self._local_result(self._original(x))
++        if self._shape is None and hasattr(out, "shape"):
++            self._shape = tuple(int(n) for n in out.shape)
++        return out
+diff --git a/src/dgx_monarch/vae_decode_route.py b/src/dgx_monarch/vae_decode_route.py
+index 90084fc..2b86f92 100644
+--- a/src/dgx_monarch/vae_decode_route.py
++++ b/src/dgx_monarch/vae_decode_route.py
+@@ -16,12 +16,20 @@ Worker's unit only for the exact input the stock loop asks for, built by the
+ same VAE file in the same dtype under the same attention and backend flags
+ (vae_decode_env.py). Fail-open: any error in the split path decodes the unit
+ here, with one WARNING, so a failure costs time and never a wrong image.
++
++Encode (spark-comfyui-cluster patch): the same knob also splits MiniMax H3
++video encodes. A keyed wrapper on ``VAE.encode`` shadows the model's
++``encode_temporal`` and replays it with the per-clip ``_adaptive_encode``
++swapped (vae_decode_plan.H3EncodeReplay); each clip encodes independently, so
++a Worker's clip is the driver's clip, byte for byte. ``DGXM_VAE_ENCODE=off``
++keeps encodes on the driver.
+ """
+ from __future__ import annotations
+ 
+ import contextvars
+ import functools
+ import inspect
++import os
+ import threading
+ import time
+ import weakref
+@@ -30,7 +38,8 @@ from contextlib import ExitStack, contextmanager
+ from typing import Any
+ 
+ from .log import get_logger
+-from .vae_decode_families import DECODE, DECODE_TILED, H3_CHUNK, MULTIDIM, Family, classify, small_still
++from .vae_decode_families import (DECODE, DECODE_TILED, ENCODE, H3_CHUNK, H3_ENCODE, MULTIDIM, Family,
++                                   classify, small_still)
+ from .vae_decode_schedule import UnitBoard, pump
+ from .vae_decode_telemetry import DecodeRecord, publish
+ 
+@@ -118,6 +127,80 @@ def install() -> None:
+         current = comfy.utils.tiled_scale_multidim
+         if not getattr(current, _KEY, False):
+             comfy.utils.tiled_scale_multidim = _tiled_wrapper(current)
++        current = comfy.sd.VAE.encode
++        if not getattr(current, _KEY, False):
++            comfy.sd.VAE.encode = _encode_wrapper(current)
++
++
++def encode_enabled() -> bool:
++    return os.environ.get("DGXM_VAE_ENCODE", "auto").strip().lower() not in ("0", "off", "false", "no")
++
++
++def _encode_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
++    @functools.wraps(original)
++    def encode(self: Any, pixel_samples: Any, *args: Any, **kwargs: Any) -> Any:
++        if _ACTIVE.get() is not None or _ARMED is None or not encode_enabled():
++            return original(self, pixel_samples, *args, **kwargs)
++        route = _open_encode(self, pixel_samples)
++        if route is None:
++            return original(self, pixel_samples, *args, **kwargs)
++        return route.run(lambda: original(self, pixel_samples, *args, **kwargs))
++
++    setattr(encode, _KEY, True)
++    return encode
++
++
++def _encode_frames(vae: Any, pixels: Any) -> int:
++    """Frames ``VAE.encode`` hands the model: a video VAE folds a 4-D batch into time."""
++    shape = tuple(getattr(pixels, "shape", ()))
++    if len(shape) == 4:
++        return int(shape[0]) if not getattr(vae, "not_video", False) else 1
++    return int(shape[1]) if len(shape) == 5 else 1
++
++
++def _open_encode(vae: Any, pixels: Any) -> _Route | None:
++    """A route for this encode, or None. Only MiniMax H3 video encodes split.
++
++    Encodes the split cannot take stay here silently: an image VAE's encode is
++    the common case and logging each would bury the decode lines.
++    """
++    family, _why = classify(vae)
++    fsm = getattr(vae, "first_stage_model", None)
++    if family is None or family.kind != H3_CHUNK or getattr(fsm, "encoder", None) is None:
++        return None
++    if not callable(getattr(fsm, "encode_temporal", None)):
++        return None
++    record = DecodeRecord(family=family.name, entry=ENCODE)
++    frames = _encode_frames(vae, pixels)
++    length = int(getattr(fsm, "clip_length", 0) or 0)
++    reason = ""
++    if length <= 0 or frames <= length:
++        reason = f"{frames} frames are one encode clip here, so there is nothing to split"
++    handle = armed_handle() if not reason else None
++    if not reason and handle is None:
++        reason = "no live DGX Monarch mesh: the Init node attaches one and the first render sets it up"
++    elif not reason and getattr(handle, "setup_key", None) is None:
++        reason = "the mesh has not finished setup; the first render on it sets it up"
++    ranks: list[int] = []
++    source: dict[str, Any] | str = ""
++    if not reason:
++        from .vae_decode_remote import remote_ranks, vae_source
++
++        ranks = remote_ranks(handle)
++        source = vae_source(vae)
++        if not ranks:
++            reason = "no Worker rank sits on a GPU other than this driver's"
++        elif isinstance(source, str):
++            reason = source
++    if reason or not isinstance(source, dict):
++        record.reason = reason
++        publish(record)
++        return None
++    from .vae_decode_env import describe
++
++    route = _Route(handle, family, vae, ranks, source, describe(vae), record)
++    route.encode = True
++    return route
+ 
+ 
+ def _entry_wrapper(original: Callable[..., Any], entry: str) -> Callable[..., Any]:
+@@ -227,6 +310,7 @@ class _Route:
+         self.env = env
+         self.record = record
+         self.token: Any = None
++        self.encode = False
+         self._retired: set[int] = set()
+         self._notes: list[str] = []
+ 
+@@ -252,15 +336,16 @@ class _Route:
+                 marker = _ACTIVE.set(self)
+                 stack.callback(_ACTIVE.reset, marker)
+                 if self.family.kind == H3_CHUNK:
+-                    stack.enter_context(self._h3_shadow())
++                    stack.enter_context(self._h3_encode_shadow() if self.encode else self._h3_shadow())
+                 return call()
+         finally:
+             self.record.seconds = time.perf_counter() - started
+             self.record.split = any(self.record.remote.values())
+             if not self.record.split and not self.record.reason:
++                what = "encode" if self.encode else "decode"
+                 self.record.reason = (self._notes[0] if self._notes else
+-                                      "every unit was decoded here" if self.record.units else
+-                                      "the stock decode asked for no unit the split can take")
++                                      f"every unit was {what}d here" if self.record.units else
++                                      f"the stock {what} asked for no unit the split can take")
+             publish(self.record)
+ 
+     @staticmethod
+@@ -395,6 +480,42 @@ class _Route:
+             fsm.__dict__.pop("_adaptive_decode", None)
+             self._broken(replay)
+ 
++    @contextmanager
++    def _h3_encode_shadow(self) -> Iterator[None]:
++        fsm = self.vae.first_stage_model
++        fsm.encode_temporal = functools.partial(self.split_h3_encode, fsm)
++        try:
++            yield
++        finally:
++            fsm.__dict__.pop("encode_temporal", None)
++
++    def split_h3_encode(self, fsm: Any, x: Any, device: Any) -> Any:
++        from .vae_decode_plan import H3EncodeReplay, h3_encode_plan
++
++        original = functools.partial(type(fsm).encode_temporal, fsm)
++        try:
++            plan = h3_encode_plan(fsm, x)
++        except Exception as exc:
++            self.note(f"the H3 encode clip plan could not be read ({type(exc).__name__}: {exc})")
++            return original(x, device)
++        if len(plan) < 2:
++            self.note("the H3 encode is one clip here, so there is nothing to split")
++            return original(x, device)
++        inputs = [clip.contiguous().cpu() for clip in plan]
++        # Only the batch is known before the model runs; the replay holds every
++        # reply to the driver's own unit 0 result in dtype and full shape.
++        shapes = [(int(clip.shape[0]), None, None, None, None) for clip in plan]
++        board = self._board([(int(clip.shape[0]), int(clip.numel() // max(1, clip.shape[0])) // 8)
++                             for clip in plan], x.dtype)
++        replay = H3EncodeReplay(board, plan, fsm, max_wait_s=self._wait_s(), check_interrupt=_interrupt)
++        fsm._adaptive_encode = replay
++        try:
++            with self._pumps(board, H3_ENCODE, inputs, None, shapes.__getitem__, None):
++                return original(x, device)
++        finally:
++            fsm.__dict__.pop("_adaptive_encode", None)
++            self._broken(replay)
++
+     def _broken(self, replay: Any) -> None:
+         if replay.broken is not None:
+             self.record.local += replay.unplanned
+diff --git a/src/dgx_monarch/vae_decode_telemetry.py b/src/dgx_monarch/vae_decode_telemetry.py
+index bf9e798..2ff2ae0 100644
+--- a/src/dgx_monarch/vae_decode_telemetry.py
++++ b/src/dgx_monarch/vae_decode_telemetry.py
+@@ -50,18 +50,19 @@ class DecodeRecord:
+                 "peak_reply_gib": round(self.peak_reply_bytes / (1 << 30), 2)}
+ 
+ 
+-_NODES = {"decode": "VAE Decode", "decode_tiled": "VAE Decode (Tiled)"}
++_NODES = {"decode": "VAE Decode", "decode_tiled": "VAE Decode (Tiled)", "encode": "VAE Encode"}
+ 
+ 
+ def info_line(record: DecodeRecord) -> str:
+     """The one INFO line a decode logs."""
+     node = _NODES.get(record.entry, record.entry)
++    what = "encode" if record.entry == "encode" else "decode"
+     if not record.split:
+-        return f"VAE decode not split ({record.family or 'unknown'}, {node}): {record.reason}"
++        return f"VAE {what} not split ({record.family or 'unknown'}, {node}): {record.reason}"
+     shares = ", ".join(f"{count} on rank {rank}" for rank, count in sorted(record.remote.items()) if count)
+     waits = (f"; ranks paused {record.budget_waits} times on the reply budget, "
+              f"{record.peak_reply_bytes / (1 << 30):.2f} GiB held at most" if record.budget_waits else "")
+-    return (f"VAE decode split over {record.ranks} ranks ({record.family}, {node}): "
++    return (f"VAE {what} split over {record.ranks} ranks ({record.family}, {node}): "
+             f"{record.units} units, {record.local} here, {shares}, {record.seconds:.1f} s{waits}")
+ 
+ 
+@@ -69,8 +70,10 @@ def warning_line(record: DecodeRecord) -> str | None:
+     """The WARNING a decode logs when any rank fell back, else None."""
+     if not record.failures:
+         return None
+-    return (f"Worker-assisted VAE decode fell back to this driver for {record.fallback} of "
+-            f"{record.units} units, so the image is the one-host decode: {record.failures[0]}")
++    what = "encode" if record.entry == "encode" else "decode"
++    result = "latent" if record.entry == "encode" else "image"
++    return (f"Worker-assisted VAE {what} fell back to this driver for {record.fallback} of "
++            f"{record.units} units, so the {result} is the one-host {what}: {record.failures[0]}")
+ 
+ 
+ _LOCK = threading.Lock()
+diff --git a/tests/test_mesh_lock_safety.py b/tests/test_mesh_lock_safety.py
+index 641db83..a58ccca 100644
+--- a/tests/test_mesh_lock_safety.py
++++ b/tests/test_mesh_lock_safety.py
+@@ -1129,6 +1129,8 @@ _OFF_LOOP_BY_CONSTRUCTION = {
+         "ContextVar read, not a monarch future",
+     ("vae_decode_route.py", "_entry_wrapper.decode"):
+         "ContextVar read, not a monarch future",
++    ("vae_decode_route.py", "_encode_wrapper.encode"):
++        "ContextVar read, not a monarch future",
+     ("vae_decode_route.py", "_tiled_wrapper.tiled_scale_multidim"):
+         "ContextVar read, not a monarch future",
+ }
+diff --git a/tests/test_vae_encode_split_comfy.py b/tests/test_vae_encode_split_comfy.py
+new file mode 100644
+index 0000000..bfa72bc
+--- /dev/null
++++ b/tests/test_vae_encode_split_comfy.py
+@@ -0,0 +1,164 @@
++"""Real ComfyUI: a Worker-assisted MiniMax H3 encode is byte-identical to the stock encode.
++
++spark-comfyui-cluster patch. The reference is ComfyUI's own
++``MiniMaxH3VideoVAE.encode`` (``encode_temporal``: independent clip_length-frame
++clips, each spatially tiled and blended by ``tiled_encode``). The split replays
++that loop with simulated Worker ranks computing the clips they claim exactly as
++the Worker body does (``_adaptive_encode(_normalize_pixels(clip))``). The
++per-tile encoder is a deterministic stand-in, as in the decode tests; the
++hardware leg is a GB10 Worker's real clip equal to the driver's.
++"""
++from __future__ import annotations
++
++import time
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from dgx_monarch import vae_decode_route
++from dgx_monarch.actor import vae_decode as worker_body
++from dgx_monarch.vae_decode_families import H3_CHUNK, H3_ENCODE
++
++from test_vae_decode_split_comfy import _Ranks, _route, comfy, ranks, same_bytes  # noqa: F401
++
++
++def _h3(comfy, dtype=torch.float32):
++    """The real H3 VAE class, 64 px tiles, with a deterministic stand-in for the per-tile encoder."""
++    fsm = comfy.minimax.MiniMaxH3VideoVAE(encoder=False, decoder=False, tile_size=64, tile_overlap_min=16)
++    fsm.encoder = torch.nn.Identity()  # present; the stand-in below does the work
++
++    def moments(x):
++        # [B, 3, 17, H, W] -> [B, 48, 5, H/16, W/16], mixing time, space and channels
++        b, c, t, h, w = x.shape
++        pooled = torch.nn.functional.avg_pool3d(x.float(), kernel_size=(1, 16, 16))
++        first = pooled[:, :, :1]
++        rest = pooled[:, :, 1:].reshape(b, c, (t - 1) // 4, 4, h // 16, w // 16).mean(dim=3)
++        z = torch.cat([first, rest], dim=2)
++        out = torch.cat([torch.tanh(z * (0.5 + 0.03 * k) + 0.01 * k) for k in range(16)], dim=1)
++        return out.to(x.dtype)
++
++    slow = {"armed": False}
++
++    def first_slow(x):
++        if slow["armed"]:
++            slow["armed"] = False
++            time.sleep(0.5)
++        return moments(x)
++
++    fsm._encode_moments = first_slow
++    fsm.arm_slow_first = lambda: slow.update(armed=True)
++    return fsm.to(dtype)
++
++
++def _worker_clip(worker):
++    return lambda clip: type(worker)._adaptive_encode(worker, type(worker)._normalize_pixels(worker, clip))
++
++
++def _encode_route(fsm, remote):
++    route = _route(SimpleNamespace(first_stage_model=fsm), H3_CHUNK, list(range(1, remote + 1)))
++    route.encode = True
++    route.record.entry = "encode"
++    return route
++
++
++@pytest.mark.parametrize("frames", [22, 39, 124])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
++@pytest.mark.parametrize("remote", [1, 2])
++def test_h3_encode_split_is_byte_identical(comfy, ranks, frames, dtype, remote):
++    torch.manual_seed(7)
++    x = (torch.rand(1, 3, frames, 80, 96) * 2 - 1).to(dtype)    # [-1, 1], as VAE.encode hands it
++    driver, worker = _h3(comfy, dtype), _h3(comfy, dtype)
++    stock = driver.encode(x)
++    ranks(_Ranks(_worker_clip(worker), delay_s=0.05))
++    route = _encode_route(driver, remote)
++    driver.arm_slow_first()
++    split = route.run(lambda: driver.encode(x))
++    assert same_bytes(split, stock)
++    assert "encode_temporal" not in driver.__dict__ and "_adaptive_encode" not in driver.__dict__
++    clips = -(-frames // driver.clip_length)
++    assert route.record.units == clips
++    assert route.record.local + sum(route.record.remote.values()) == clips
++    assert sum(route.record.remote.values()) >= 1 and not route.record.failures
++
++
++@pytest.mark.parametrize("failure", ["raise", "decline", "dtype", "shape"])
++def test_a_failing_rank_keeps_the_stock_bytes(comfy, ranks, failure):
++    x = torch.rand(1, 3, 56, 64, 64) * 2 - 1
++    driver, worker = _h3(comfy), _h3(comfy)
++    stock = driver.encode(x)
++    compute = _worker_clip(worker)
++    if failure == "shape":
++        compute = lambda clip: _worker_clip(worker)(clip)[..., :-1].contiguous()  # noqa: E731
++        fail = None
++    else:
++        fail = {"raise": lambda r, u: RuntimeError("sibling lost") if u >= 2 else None,
++                "decline": lambda r, u: "decline", "dtype": lambda r, u: "dtype"}[failure]
++    ranks(_Ranks(compute, fail=fail, delay_s=0.05))
++    route = _encode_route(driver, 1)
++    driver.arm_slow_first()
++    assert same_bytes(route.run(lambda: driver.encode(x)), stock)
++    assert route.record.local + sum(route.record.remote.values()) == route.record.units
++
++
++def test_a_single_clip_and_a_still_stay_here(comfy, ranks):
++    driver, worker = _h3(comfy), _h3(comfy)
++    ranks(_Ranks(_worker_clip(worker)))
++    for frames in (17, 1):
++        x = torch.rand(1, 3, frames, 64, 64) * 2 - 1
++        route = _encode_route(driver, 1)
++        assert same_bytes(route.run(lambda: driver.encode(x)), driver.encode(x))
++        assert sum(route.record.remote.values()) == 0
++
++
++def test_a_clip_the_loop_does_not_hand_over_as_planned_encodes_here(comfy, ranks, monkeypatch):
++    """A stock loop that cuts clips differently from the plan: the rest encodes here."""
++    from dgx_monarch import vae_decode_plan
++
++    x = torch.rand(1, 3, 56, 64, 64) * 2 - 1
++    driver, worker = _h3(comfy), _h3(comfy)
++    stock = driver.encode(x)
++    real = vae_decode_plan.h3_encode_plan
++    monkeypatch.setattr(vae_decode_plan, "h3_encode_plan", lambda fsm, x: [c.flip(2) for c in real(fsm, x)])
++    ranks(_Ranks(_worker_clip(worker)))
++    route = _encode_route(driver, 1)
++    assert same_bytes(route.run(lambda: driver.encode(x)), stock)
++    assert sum(route.record.remote.values()) == 0
++
++
++def test_the_worker_body_encodes_one_clip_as_the_stock_loop_does(comfy):
++    fsm = _h3(comfy, torch.float16)
++    clip = (torch.rand(1, 3, 17, 64, 96) * 2 - 1).to(torch.float16)
++    spec = SimpleNamespace(kind=H3_ENCODE, output_dtype=None)
++    expected = type(fsm)._adaptive_encode(fsm, type(fsm)._normalize_pixels(fsm, clip))
++    assert same_bytes(worker_body._run_unit(fsm, spec, clip), expected)
++    bare = comfy.minimax.MiniMaxH3VideoVAE(encoder=False, decoder=False)
++    with pytest.raises(worker_body.Decline):
++        worker_body._run_unit(bare, spec, clip)
++    assert H3_ENCODE in worker_body.KINDS
++
++
++def test_the_encode_wrapper_is_keyed_and_off_switch(comfy, monkeypatch):
++    stock = comfy.sd.VAE.encode
++    monkeypatch.setattr(comfy.sd.VAE, "encode", stock)
++    vae_decode_route.install()
++    wrapped = comfy.sd.VAE.encode
++    assert getattr(wrapped, vae_decode_route._KEY, False) and wrapped.__wrapped__ is stock
++    vae_decode_route.install()  # never stacked
++    assert comfy.sd.VAE.encode is wrapped
++    monkeypatch.setenv("DGXM_VAE_ENCODE", "off")
++    assert not vae_decode_route.encode_enabled()
++    monkeypatch.setenv("DGXM_VAE_ENCODE", "auto")
++    assert vae_decode_route.encode_enabled()
++
++
++def test_stock_seams_the_encode_split_replays(comfy):
++    import inspect
++
++    temporal = inspect.getsource(comfy.minimax.MiniMaxH3VideoVAE.encode_temporal)
++    assert "self._adaptive_encode(self._normalize_pixels(clip_x))" in temporal
++    assert "math.ceil(x.shape[2] / self.clip_length)" in temporal
++    assert "clip_x[:, :, -1:].repeat(1, 1, self.clip_length - clip_x.shape[2], 1, 1)" in temporal
++    assert "self.encode_temporal(x, device)" in inspect.getsource(comfy.minimax.MiniMaxH3VideoVAE.encode)
++    encode = inspect.getsource(comfy.sd.VAE.encode)
++    assert "self.first_stage_model.encode(pixels_in, device=self.device)" in encode

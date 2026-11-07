@@ -7,6 +7,7 @@ scripts that produced the numbers. The user-facing instructions are in the main
 | Note | What it covers |
 |---|---|
 | [text-encoders.md](text-encoders.md) | bf16 tensor-core text encoders (mod `gb10-te-bf16`), the exact text-encoder cache, what was measured and ruled out |
+| [vae-encodes.md](vae-encodes.md) | Where a job's time goes, the reference clip encoded twice (and the exact VAE-encode cache that ends it), and H3 video encodes split over the Sparks |
 | [cluster-3-spark.md](cluster-3-spark.md) | Scaling to three Sparks: Ulysses at any degree, the switchless ring fabric, the host baseline, and the third Spark's kernel crash |
 
 ## Scripts
@@ -28,6 +29,7 @@ queued.
 | `text-encoder/t_encode.py` | `save FILE` / `compare FILE`: one encode through ComfyUI's normal path, saved or compared bit for bit (`SPARK_TE_COMPUTE` decides the precision) |
 | `text-encoder/p8_cachekey.py` | Whether the real H3 encoder gets a text-encoder cache key, and if not why |
 | `text-encoder/test_te_cache.py` | CPU unit tests of `te_cache.py` (run with `CUDA_VISIBLE_DEVICES=` and the module path as argument) |
+| `vae/test_vae_cache.py` | CPU unit tests of `vae_cache.py` (run with `CUDA_VISIBLE_DEVICES=` and the overlay pack folder as argument) |
 | `ulysses/t_headpad.py`, `t_wrapper.py`, `t_topo.py` | CPU tests of head padding through yunchang's all-to-all and dgx-monarch's real USP wrapper, and the topology decision per world size |
 | `cluster/rt.sh` | On one Spark: every fabric address answers, through a fabric port |
 | `cluster/ctr.sh` | Per-port RDMA and management traffic over 10 s (run on each Spark during a render) |

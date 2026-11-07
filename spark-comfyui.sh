@@ -2181,6 +2181,10 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     || CRUN_ARGS+=(-e "SPARK_TE_COMPUTE=$SPARK_TE_COMPUTE")
   [[ -z "${SPARK_TE_CACHE_MB:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_TE_CACHE_MB=$SPARK_TE_CACHE_MB")
+  [[ -z "${SPARK_VAE_CACHE:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_VAE_CACHE=$SPARK_VAE_CACHE")
+  [[ -z "${SPARK_VAE_CACHE_MB:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_VAE_CACHE_MB=$SPARK_VAE_CACHE_MB")
   [[ -z "${SPARK_VIDEO_REF_SIZE:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_VIDEO_REF_SIZE=$SPARK_VIDEO_REF_SIZE")
   [[ -z "${SPARK_FACE_ON_CLUSTER:-}" ]] \
