@@ -1,7 +1,7 @@
 # VAE encodes on the cluster
 
 Traced 2026-11-07 on the 3-Spark ring, from the log of a 5 s MiniMax H3 ref2va
-job (H3_00199, 506.6 s): 2 reference images, a reference video with its
+job (506.6 s): 2 reference images, a reference video with its
 soundtrack, face pass on.
 
 ## Where a job's time went
@@ -99,7 +99,7 @@ copy (git ownership, Studio file ownership).
 
 A standalone script that loaded the H3 video VAE in the driver container and
 encoded a 124-frame clip ran the host out of memory twice (the second time with
-22 frames), killing the driver ComfyUI and a user's queued job. The script's
+22 frames), killing the driver ComfyUI and a queued job. The script's
 VAE took ComfyUI's non-dynamic "loaded completely" path, unlike the server's
 dynamic-VRAM load. Don't encode with the video VAE outside the server process;
 test VAE code on CPU, and verify on a real render.

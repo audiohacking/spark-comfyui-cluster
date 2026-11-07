@@ -1,4 +1,6 @@
-B=/home/user/Documents/ComfyUI
+#!/usr/bin/env bash
+# One host's baseline, for side-by-side comparison across Sparks.
+B=${SPARK_BASE:-$HOME/Documents/ComfyUI}   # where spark-comfyui-cluster and spark-comfyui live
 echo "kernel=$(uname -r)"
 echo "driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader) pm=$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader) clocks=$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader)"
 echo "dgx_os=$(grep -h VERSION= /etc/dgx-release 2>/dev/null | tail -1)"

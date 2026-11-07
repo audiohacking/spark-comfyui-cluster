@@ -558,7 +558,7 @@ A render spreads over every Spark in `spark-cluster.toml`, whatever their number
 **1. Fabric.** Every Spark must reach every other one over the 100G fabric, because each render exchanges data between all pairs.
 
 - *On a switch:* one more port in the same subnet.
-- *Three Sparks without a switch (a ring):* cable each Spark's port 0 to the next one's port 1, and let NVIDIA's network setup address the cables. It gives every cable its own subnets (one per half of the port), so each Spark only knows the addresses on its own two cables. Add a route file on **every** Spark that sends the other cable's addresses straight over the direct cable to their owner, for example on the Spark whose port 1 is `FABRIC_IP` and port 0 `FABRIC_IP`:
+- *Three Sparks without a switch (a ring):* cable each Spark's port 0 to the next one's port 1, and let NVIDIA's network setup address the cables. It gives every cable its own subnets (one per half of the port), so each Spark only knows the addresses on its own two cables. Add a route file on **every** Spark that sends the other cable's addresses straight over the direct cable to their owner. On a Spark whose port 1 faces `NEXT` and port 0 faces `PREV`, with `NEXT_P0A`/`NEXT_P0B` the next Spark's addresses on this Spark's port-1 cable (one per half), `PREV_P1A`/`PREV_P1B` the previous Spark's addresses on the port-0 cable, and `NEXT_P1A`/`NEXT_P1B` and `PREV_P0A`/`PREV_P0B` their addresses on the third cable:
 
   ```yaml
   # /etc/netplan/98-spark-fabric-routes.yaml (mode 600), then: sudo netplan apply
@@ -566,19 +566,19 @@ A render spreads over every Spark in `spark-cluster.toml`, whatever their number
     version: 2
     renderer: NetworkManager
     ethernets:
-      enp1s0f1np1:   {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
-      enP2p1s0f1np1: {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
-      enp1s0f0np0:   {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
-      enP2p1s0f0np0: {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
+      enp1s0f1np1:   {routes: [{to: NEXT_P1A/32, via: NEXT_P0A}]}
+      enP2p1s0f1np1: {routes: [{to: NEXT_P1B/32, via: NEXT_P0B}]}
+      enp1s0f0np0:   {routes: [{to: PREV_P0A/32, via: PREV_P1A}]}
+      enP2p1s0f0np0: {routes: [{to: PREV_P0B/32, via: PREV_P1B}]}
   ```
 
   If NVIDIA's setup runs again it may disable this file; check it is still in `/etc/netplan`.
 
-Then check from every Spark that each other Spark's addresses answer **through a fabric port**, never the management NIC or VPN:
+Then check from every Spark that each other Spark's addresses answer **through a fabric port**, never the management NIC or a VPN interface:
 
 ```bash
 ping -c2 NEW
-ip route get NEW        # dev enp1s0f… or enP2p1s0f…, not enP7s7 or vpn0
+ip route get NEW        # dev enp1s0f… or enP2p1s0f…, not the management NIC or a VPN
 ```
 
 Add the new address to the fabric's source restrictions ([Before you start](#before-you-start), item 5).

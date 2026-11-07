@@ -2,7 +2,7 @@
 
 Loads the real Qwen3-VL-32B H3 encoder the way ComfyUI's CLIPLoader does,
 builds an H3 ref2va presentation like Continuity's (2 reference images, a
-reference video at 2 fps, an audio slot, the H3_00191 prompt), and times:
+reference video at 2 fps, an audio slot, a long prompt), and times:
 tokenize, each vision item, each LM layer, the whole encode (cold and warm).
 Saves the tokens and the conditioning for the identity tests that follow.
 """

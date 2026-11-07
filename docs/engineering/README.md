@@ -31,8 +31,10 @@ queued.
 | `text-encoder/test_te_cache.py` | CPU unit tests of `te_cache.py` (run with `CUDA_VISIBLE_DEVICES=` and the module path as argument) |
 | `vae/test_vae_cache.py` | CPU unit tests of `vae_cache.py` (run with `CUDA_VISIBLE_DEVICES=` and the overlay pack folder as argument) |
 | `ulysses/t_headpad.py`, `t_wrapper.py`, `t_topo.py` | CPU tests of head padding through yunchang's all-to-all and dgx-monarch's real USP wrapper, and the topology decision per world size |
-| `cluster/rt.sh` | On one Spark: every fabric address answers, through a fabric port |
+| `cluster/rt.sh` | On one Spark: every given fabric address answers, through a fabric port |
 | `cluster/ctr.sh` | Per-port RDMA and management traffic over 10 s (run on each Spark during a render) |
 | `cluster/eq.sh` | One host's kernel, driver, Docker, swap, sysctl, memlock, repo, config and image, for side-by-side comparison |
 | `cluster/therm.sh` | One host's boot options, clocks, modprobe options, NVIDIA services, BIOS and NVIDIA packages |
-| `cluster/sync03.sh` | The fabric copy that seeded the third Spark (repos, data, models; parallel rsync) |
+| `cluster/a2a_bench.sh`, `a2a_bench.py` | NCCL all-to-all (and p2p, bidir, ring) bandwidth at H3's Ulysses shape across the cluster's Sparks, with its fabric settings |
+| `cluster/step_profile.sh`, `analyze_step_trace.py` | Profile one sampling step on every rank of the next render, and where its GPU time went |
+| `cluster/sync_spark.sh` | Seed a new Spark over the fabric (repos, data, models; parallel rsync) |

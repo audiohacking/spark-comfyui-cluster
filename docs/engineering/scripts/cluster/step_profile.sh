@@ -6,10 +6,15 @@
 # The request lives in each host's dgx-monarch cache dir, which the worker
 # container mounts at ~/.cache/dgx-monarch (actor/step_profile.py, patch
 # monarch-step-profile). Each id is served once per Worker process.
+# Hosts come from spark-cluster.toml (CLUSTER_CONF overrides the path).
 set -euo pipefail
-HOSTS=(FABRIC_IP FABRIC_IP FABRIC_IP)
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/../../../.." && pwd)
+CONF=${CLUSTER_CONF:-$REPO/spark-cluster.toml}
+mapfile -t HOSTS < <(python3 "$REPO/lib/cluster_read.py" "$CONF" hosts | cut -f1)
+# The host side of the worker's ~/.cache/dgx-monarch (spark-comfyui.sh's default state dir).
 DIR=.local/state/spark-comfyui-cluster/.cache/dgx-monarch
-# This Spark is reached directly: ssh to its own fabric address has no known host key.
+# This Spark is reached directly: ssh to its own fabric address may have no known host key.
 here() { ip -o -4 addr show | grep -qw "inet $1"; }
 on() { local h=$1; shift; if here "$h"; then bash -c "$*"; else ssh -o BatchMode=yes "$h" "$*"; fi; }
 cmd=${1:?request|collect}; id=${2:?id}

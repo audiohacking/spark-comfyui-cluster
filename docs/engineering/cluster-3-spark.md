@@ -1,7 +1,7 @@
 # Three Sparks
 
-From two Sparks to three, 2026-11-06 to 2026-11-07: spark-a (driver +
-worker), spark-b, spark-c.
+From two Sparks to three, 2026-11-06 to 2026-11-08. The Sparks are called A
+(driver and worker), B and C below.
 
 ## Ulysses at any degree (`container/monarch-ulysses-any-world.patch`)
 
@@ -29,7 +29,7 @@ Tests (`docs/engineering/scripts/ulysses/`, CPU over gloo):
 - **World-2 decisions unchanged** across the topology table.
 
 On hardware:
-- **2 Sparks, re-run of H3_00191 (seed 823985181201152):** latents
+- **2 Sparks, re-run of an earlier render with the same seed:** latents
   bit-identical to the day before. Main pass video `e8052715…` / audio
   `95b628af…`, face pass `eb088d72…` / `540b9ec0…`, at the same sampling
   times (302.6 s, 228.0 s).
@@ -45,28 +45,27 @@ PCIe half of the port:
 
 | Cable | Subnets | Addresses |
 |---|---|---|
-| A port 1 ↔ B port 0 | FABRIC_SUBNET/24, FABRIC_SUBNET/24 | A .2, B .1 |
-| B port 1 ↔ C port 0 | FABRIC_SUBNET/24, FABRIC_SUBNET/24 | B .1, C .2 |
-| C port 1 ↔ A port 0 | FABRIC_SUBNET/24, FABRIC_SUBNET/24 | C .2, A .1 |
+| A port 1 ↔ B port 0 | two /24s, one per PCIe half | one address per Spark per half |
+| B port 1 ↔ C port 0 | two /24s | one address per Spark per half |
+| C port 1 ↔ A port 0 | two /24s | one address per Spark per half |
 
 Each Spark only knew its own two cables' subnets; the third cable's addresses
-fell through to the default route on the management NIC (`enP7s7`, which
+fell through to the default route on the management NIC (which
 negotiated **1 GbE** on all three). `/etc/netplan/98-spark-fabric-routes.yaml`
 on each Spark adds /32 routes to the four non-adjacent addresses via the
 direct cable to their owner. In a 3-ring every pair is adjacent, so nothing is
 forwarded. `cluster/rt.sh` checks all twelve addresses from a Spark.
 
-Cluster addressing: each Spark is named by its port-1 address (A
-`FABRIC_IP` = driver and NCCL master, B `FABRIC_IP`, C
-`FABRIC_IP`), so `NCCL_SOCKET_IFNAME = enp1s0f1np1` finds the right
+Cluster addressing: each Spark is named by its port-1 address (A's is the
+driver and NCCL master address), so `NCCL_SOCKET_IFNAME = enp1s0f1np1` finds the right
 address everywhere. NCCL uses all four port halves (`NCCL_IB_HCA` lists
 `rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) with
 `NCCL_IB_SUBNET_AWARE_ROUTING=1` and `NCCL_IB_MERGE_NICS=0`. The image's NCCL
 is 2.30.7.
 
-VPN was not involved: its routing table (52) held only the VPN network /32s,
-with `RouteAll` false and no exit node. Hostnames resolve to the LAN or
-VPN network, so tests run by hostname never touch the fabric.
+A VPN overlay on the management side was not involved: its routes covered only
+its own addresses. Hostnames resolve to the management network or the VPN, so
+tests run by hostname never touch the fabric.
 
 ### Measured (perftest `ib_write_bw -R`, iperf2)
 
@@ -81,7 +80,7 @@ VPN network, so tests run by hostname never touch the fabric.
 The "26 Gb/s" a speed test showed was one TCP stream (one CPU core at MTU
 1500), not the routing. During a 3-Spark H3 render, every Spark spread its
 traffic evenly over all four halves (~2.6 Gb/s each, 10 s average, bursty
-all-to-all), with 0 on the management NIC and on VPN.
+all-to-all), with 0 on the management NIC and the VPN.
 
 ## The host baseline
 
@@ -102,7 +101,7 @@ dgx-monarch never calls `mstflint`; what launched it at that moment was not
 identified. On the next boot the manager flashed the ConnectX-7 from
 28.45.4028 to 28.50.1002.
 
-**Aligned to A/B** (known good):
+**Aligned to A and B** (known good):
 - **Kernel 7.0.0-1019-nvidia.** apt only offers its NVIDIA module as build
   `+2`, so A's exact `+1` build and the 1019 `hwe` meta packages were
   rebuilt from its installed files with `dpkg-repack`. They are kept in
@@ -122,7 +121,7 @@ identified. On the next boot the manager flashed the ConnectX-7 from
 - **Docker:** the classic image store
   (`{"features": {"containerd-snapshotter": false}}`). With the containerd
   store a pushed image gets another ID.
-- **Hostname:** `spark-c` (was `spark-c`).
+- **Hostname:** renamed to the cluster's naming scheme.
 
 Pitfall: downgrading a library listed in the CDI spec
 (`libnvidia-egl-wayland1`) left the worker container unable to start
@@ -171,14 +170,14 @@ nothing was launch-bound. Per DiT block (50 per step, ~385 ms):
 | quantize, norm, RoPE, elementwise | ~30 |
 
 Compute (~10.7 s per step) matched a single-GB10 H3 profile scaled to our
-per-rank shapes (newjordan/h3-spark: attention ~164-180 TOPS on both). The
+per-rank shapes (a published single-GB10 H3 profile: attention ~164-180 TOPS on both). The
 all-to-all moved 128 MB out of each rank in ~39 ms: 25 Gb/s, with no overlap.
 
 `scripts/cluster/a2a_bench.py` (one process per Spark in the worker
 containers, `a2a_bench.sh`) reproduced it outside a render: 41 ms at the
 traced shape, linear in size (a bandwidth wall), and no NCCL setting moved it
 (channels, QPs per connection, buffer and chunk sizes, protocol, GDR level).
-Its p2p/bidir/ring modes then showed every transfer *from* spark-b at
+Its p2p/bidir/ring modes then showed every transfer *from* Spark B at
 ~13-16 Gb/s and every other direction at 90-100 Gb/s; raw `ib_write_bw`,
 `ib_read_bw` responses and TCP agreed. Cables, FEC, error and pause counters,
 NIC firmware configuration (mstconfig), QoS, IOMMU mode, PCIe width/speed/MPS/
@@ -193,8 +192,8 @@ After that reboot:
   and `gb10-clock-cap` waited; `sudo plymouth quit` released them. Check
   `systemctl is-system-running` after rebooting a Spark.
 - The next render failed at its first collective: `ibv_modify_qp failed with
-  110 Connection timed out ... local GID ::ffff:FABRIC_IP, remote GID
-  ::ffff:FABRIC_IP`. dgx-monarch's `generic-roce` profile pins
+  110 Connection timed out ... local GID <A's port-0 address>, remote GID
+  <B's port-0 address>`. dgx-monarch's `generic-roce` profile pins
   `NCCL_IB_GID_INDEX=3`, but the RoCE v2 IPv4 GID sits at index 4 on some NICs
   (A's port-1 halves, C's port-0 halves), so NCCL paired NICs whose
   cables do not reach each other. `NCCL_IB_GID_INDEX = "-1"` in the fabric

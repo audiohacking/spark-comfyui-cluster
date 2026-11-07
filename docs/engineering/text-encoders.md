@@ -1,6 +1,6 @@
 # Text encoders on the GB10
 
-Measured 2026-11-07 on spark-a (GB10, driver 580.178.04, kernel
+Measured 2026-11-07 on one DGX Spark (GB10, driver 580.178.04, kernel
 7.0.0-1019-nvidia, ComfyUI v0.43.0), with MiniMax H3's text encoder
 `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` and a real ref2va presentation:
 2 reference images, a reference video at 2 fps (5 two-frame blocks), an audio
@@ -96,8 +96,8 @@ Comfy-Org's file, layers 0/25/49) was attempted to separate the fp4-weight
 error from the bf16-compute error. Its harness did not reproduce ComfyUI's own
 layer output (attention 168% and MLP 65% apart with the same weights), most
 likely because of in-place writes in ComfyUI's fused ops, so its numbers were
-discarded. Quality was judged on renders instead: the user approved the bf16
-results on 2026-11-07.
+discarded. Quality was judged on renders instead, side by side with fp32, and the bf16
+results were accepted.
 
 ## What shipped
 
@@ -160,5 +160,5 @@ pass whose tokens equal another pass's.
 
 Not run: re-queueing an earlier job exactly, to show bit-identical latents
 across restarts (bf16 determinism) and through a cache hit (cache exactness).
-The plan was to re-queue `H3_00195` (encodes fresh) and then `H3_00197` (its
-encodes must come from the cache), comparing latent hashes with the originals.
+The test: re-queue a job whose encodes run fresh, then one whose encodes must
+come from the cache, comparing latent hashes with the original renders.
