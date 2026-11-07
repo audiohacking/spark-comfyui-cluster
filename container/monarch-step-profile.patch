@@ -1,0 +1,286 @@
+diff --git a/src/dgx_monarch/actor/sampling.py b/src/dgx_monarch/actor/sampling.py
+index c5e9488..f48e9cf 100644
+--- a/src/dgx_monarch/actor/sampling.py
++++ b/src/dgx_monarch/actor/sampling.py
+@@ -514,6 +514,9 @@ def run_ksampler(
+     leader = is_result_leader()
+     callback, finish = make_progress_callback(
+         progress_port if leader else None, int(request["steps"]), cancel_event)
++    from .step_profile import session as _step_profile
++
++    callback, profile_close = _step_profile(callback)
+ 
+     start_step = advanced.get("start_at_step")
+     last_step = advanced.get("end_at_step")
+@@ -541,6 +544,7 @@ def run_ksampler(
+             seed=seed,
+         )
+     finally:
++        profile_close()
+         finish()
+ 
+     latent_outputs.validate_tensor_tree(
+@@ -610,13 +614,17 @@ def run_custom(model_patcher, request: dict, uncond_patcher=None, progress_port=
+         if callback is not None:
+             callback(step, x0, x, total)
+ 
++    from .step_profile import session as _step_profile
++
++    sample_callback, profile_close = _step_profile(wrapped_callback)
+     try:
+         samples = guider.sample(
+             noise, latent_image, sampler, sigmas,
+-            denoise_mask=noise_mask, callback=wrapped_callback,
++            denoise_mask=noise_mask, callback=sample_callback,
+             disable_pbar=True, seed=seed,
+         )
+     finally:
++        profile_close()
+         finish()
+ 
+     latent_outputs.validate_tensor_tree(
+diff --git a/src/dgx_monarch/actor/step_profile.py b/src/dgx_monarch/actor/step_profile.py
+new file mode 100644
+index 0000000..316357e
+--- /dev/null
++++ b/src/dgx_monarch/actor/step_profile.py
+@@ -0,0 +1,167 @@
++"""Profile one sampling step on every rank, on request (spark-comfyui-cluster patch).
++
++Off unless asked: a request file in this host's dgx-monarch cache directory,
++``~/.cache/dgx-monarch/step-profile.request``, holding JSON such as
++``{"id": "run1", "step": 3}``. The next render each rank samples after the
++request appears profiles that step (0-based, default 3) with torch.profiler,
++CPU and CUDA activity, and writes, under ``~/.cache/dgx-monarch/step-profile/``:
++
++- ``<id>-rank<r>-<host>.json.gz``: the Chrome trace of the profiled step;
++- ``<id>-rank<r>-<host>.txt``: kernel/op tables sorted by CUDA and CPU time;
++- ``<id>-rank<r>-<host>.summary.json``: every step's wall time on this rank
++  and the profiled window.
++
++Each request id is served once per Worker process. Without a request the
++sampler runs exactly as before: the callback the sampler gets is the one it
++always got. Profiling observes; it does not change a single kernel's inputs.
++Step boundaries are the sampler's own callback, which every rank runs at the
++same step, so the window covers one model evaluation plus the sampler update.
++"""
++from __future__ import annotations
++
++import gzip
++import json
++import os
++import shutil
++import socket
++import time
++from pathlib import Path
++from typing import Any
++
++from ..log import get_logger
++
++log = get_logger(__name__)
++
++_DONE: set[str] = set()
++
++
++def _dir() -> Path:
++    return Path(os.path.expanduser("~")) / ".cache" / "dgx-monarch"
++
++
++def _request() -> dict | None:
++    path = _dir() / "step-profile.request"
++    try:
++        raw = path.read_text(encoding="utf-8")
++    except OSError:
++        return None
++    try:
++        spec = json.loads(raw) if raw.strip() else {}
++    except ValueError:
++        spec = {}
++    ident = str(spec.get("id") or int(path.stat().st_mtime))
++    if ident in _DONE:
++        return None
++    try:
++        step = max(1, int(spec.get("step", 3)))
++    except (TypeError, ValueError):
++        step = 3
++    return {"id": "".join(c for c in ident if c.isalnum() or c in "-_.")[:64] or "profile", "step": step}
++
++
++def _rank() -> int:
++    try:
++        import torch.distributed as dist
++
++        if dist.is_available() and dist.is_initialized():
++            return int(dist.get_rank())
++    except Exception:
++        pass
++    return int(os.environ.get("RANK", "0") or 0)
++
++
++class _Session:
++    def __init__(self, spec: dict, original: Any) -> None:
++        import torch
++
++        self.spec = spec
++        self.original = original
++        self.rank = _rank()
++        self.host = socket.gethostname()
++        self.marks = [time.perf_counter()]
++        self.calls = 0
++        target = spec["step"]
++        # Steps before the target run unprofiled; the one before it warms the profiler up.
++        schedule = torch.profiler.schedule(wait=max(0, target - 1), warmup=1, active=1, repeat=1)
++        self.window: list[float] = []
++        self.profiler = torch.profiler.profile(
++            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
++            schedule=schedule, on_trace_ready=self._write, record_shapes=True, with_stack=False)
++        self.profiler.start()
++        self.written = False
++        log.info("step profile %s: rank %d on %s profiles step %d", spec["id"], self.rank, self.host, target)
++
++    def __call__(self, step, x0, x, total):
++        self.marks.append(time.perf_counter())
++        self.calls += 1
++        if self.calls == self.spec["step"]:
++            self.window.append(self.marks[-1])
++        elif self.calls == self.spec["step"] + 1:
++            self.window.append(self.marks[-1])
++        try:
++            self.profiler.step()
++        except Exception as exc:
++            log.warning("step profile: profiler step failed: %r", exc)
++        if self.original is not None:
++            self.original(step, x0, x, total)
++
++    def _write(self, prof: Any) -> None:
++        out = _dir() / "step-profile"
++        out.mkdir(parents=True, exist_ok=True)
++        stem = out / f"{self.spec['id']}-rank{self.rank}-{self.host}"
++        trace = stem.with_suffix(".json")
++        prof.export_chrome_trace(str(trace))
++        with open(trace, "rb") as src, gzip.open(str(trace) + ".gz", "wb", compresslevel=3) as dst:
++            shutil.copyfileobj(src, dst)
++        trace.unlink()
++        averages = prof.key_averages()
++        tables = [
++            "== by self CUDA time ==",
++            averages.table(sort_by="self_cuda_time_total", row_limit=120, max_name_column_width=110),
++            "== by self CPU time ==",
++            averages.table(sort_by="self_cpu_time_total", row_limit=60, max_name_column_width=110),
++            "== by input shape, self CUDA time ==",
++            prof.key_averages(group_by_input_shape=True).table(
++                sort_by="self_cuda_time_total", row_limit=80, max_name_column_width=90),
++        ]
++        stem.with_suffix(".txt").write_text("\n".join(tables) + "\n", encoding="utf-8")
++        self.written = True
++
++    def close(self) -> None:
++        try:
++            self.profiler.stop()
++        except Exception:
++            pass
++        steps = [round(b - a, 4) for a, b in zip(self.marks, self.marks[1:])]
++        summary = {"id": self.spec["id"], "rank": self.rank, "host": self.host,
++                   "profiled_step": self.spec["step"], "step_wall_s": steps,
++                   "profiled_window_s": round(self.window[1] - self.window[0], 4)
++                   if len(self.window) == 2 else None,
++                   "trace_written": self.written}
++        try:
++            out = _dir() / "step-profile"
++            out.mkdir(parents=True, exist_ok=True)
++            (out / f"{self.spec['id']}-rank{self.rank}-{self.host}.summary.json").write_text(
++                json.dumps(summary, indent=1) + "\n", encoding="utf-8")
++        except OSError as exc:
++            log.warning("step profile: summary not written: %r", exc)
++        _DONE.add(self.spec["id"])
++        log.info("step profile %s: rank %d steps %s (trace %s)", self.spec["id"], self.rank, steps,
++                 "written" if self.written else "not reached")
++
++
++def session(original_callback: Any) -> tuple[Any, Any]:
++    """-> (callback for the sampler, close()). Without a request: the original callback, a no-op."""
++    try:
++        spec = _request()
++    except Exception:
++        spec = None
++    if spec is None:
++        return original_callback, lambda: None
++    try:
++        s = _Session(spec, original_callback)
++    except Exception as exc:
++        log.warning("step profile %s could not start: %r", spec["id"], exc)
++        _DONE.add(spec["id"])
++        return original_callback, lambda: None
++    return s, s.close
+diff --git a/tests/test_step_profile.py b/tests/test_step_profile.py
+new file mode 100644
+index 0000000..6cc772d
+--- /dev/null
++++ b/tests/test_step_profile.py
+@@ -0,0 +1,66 @@
++"""spark-comfyui-cluster patch: the on-request one-step profiler (actor/step_profile.py)."""
++from __future__ import annotations
++
++import gzip
++import json
++
++import torch
++
++from dgx_monarch.actor import step_profile
++
++
++def _sample(callback, steps=6):
++    x = torch.randn(64, 64)
++    for i in range(steps):
++        x = torch.tanh(x @ x.T / 64)
++        if callback is not None:
++            callback(i, x, x, steps)
++    return x
++
++
++def test_without_a_request_the_sampler_gets_its_own_callback(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    original = object()
++    callback, close = step_profile.session(original)
++    assert callback is original
++    close()
++    assert step_profile.session(None)[0] is None
++    assert not (tmp_path / ".cache" / "dgx-monarch" / "step-profile").exists()
++
++
++def test_a_request_profiles_one_step_once_and_keeps_the_callback(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    root = tmp_path / ".cache" / "dgx-monarch"
++    root.mkdir(parents=True)
++    (root / "step-profile.request").write_text(json.dumps({"id": "t1", "step": 3}))
++    seen = []
++    callback, close = step_profile.session(lambda *a: seen.append(a[0]))
++    reference = _sample(None)
++    torch.manual_seed(0)
++    out = _sample(callback)
++    close()
++    assert seen == list(range(6))                      # the original callback still runs every step
++    files = sorted(p.name for p in (root / "step-profile").iterdir())
++    assert any(f.endswith(".json.gz") for f in files) and any(f.endswith(".txt") for f in files)
++    summary = json.loads(next((root / "step-profile").glob("*.summary.json")).read_text())
++    assert summary["trace_written"] and summary["profiled_step"] == 3 and len(summary["step_wall_s"]) == 6
++    assert summary["profiled_window_s"] is not None
++    trace = json.loads(gzip.open(next((root / "step-profile").glob("*.json.gz"))).read())
++    assert trace.get("traceEvents")
++    # served once per process: the same id does not profile again
++    again, close2 = step_profile.session(None)
++    assert again is None
++    close2()
++    assert out.shape == reference.shape
++
++
++def test_a_bad_request_still_profiles_with_defaults(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    root = tmp_path / ".cache" / "dgx-monarch"
++    root.mkdir(parents=True)
++    (root / "step-profile.request").write_text("{not json")
++    callback, close = step_profile.session(None)
++    assert callback is not None
++    _sample(callback, steps=5)
++    close()
++    assert list((root / "step-profile").glob("*.summary.json"))

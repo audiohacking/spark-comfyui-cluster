@@ -514,9 +514,13 @@ USER comfy
 # Workers encode some clips of the stock encode_temporal loop, and the driver
 # takes a clip back only for the exact pixels it planned (byte-identical;
 # DGXM_VAE_ENCODE=off keeps encodes on the driver).
+# monarch-step-profile.patch: on request only (a step-profile.request file in
+# ~/.cache/dgx-monarch on each Spark), every rank records torch.profiler for
+# one sampling step; without the file the sampler runs exactly as before.
 COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
      container/monarch-cancel-agree.patch container/monarch-slab-register.patch \
-     container/monarch-ulysses-any-world.patch container/monarch-vae-encode-split.patch /opt/spark/
+     container/monarch-ulysses-any-world.patch container/monarch-vae-encode-split.patch \
+     container/monarch-step-profile.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -533,6 +537,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-ulysses-any-world.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-vae-encode-split.patch \
       || { echo "monarch-vae-encode-split.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-step-profile.patch \
+      || { echo "monarch-step-profile.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
