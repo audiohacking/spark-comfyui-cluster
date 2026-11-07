@@ -18,6 +18,9 @@ from . import continuity_monarch
 
 from . import face_route
 from . import monarch_preview
+from . import te_cache
+
+te_cache.install()  # every workflow's text encodes, Continuity or not
 
 # Built only inside Continuity's expanded graph (continuity_monarch.py).
 NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview,
@@ -31,7 +34,8 @@ try:
 
     @server.PromptServer.instance.routes.get("/spark/continuity-monarch")
     async def _status(request):
-        return web.json_response(continuity_monarch.status())
+        return web.json_response({**continuity_monarch.status(),
+                                  "te_cache": te_cache.status()})
 except Exception:
     logging.getLogger("spark.continuity_monarch").exception(
         "Continuity cluster backend: no status route")

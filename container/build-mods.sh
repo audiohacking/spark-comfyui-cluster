@@ -19,7 +19,7 @@ die()  { printf '[error] %s\n' "$*" >&2; exit 1; }
 
 : "${INSTALL_DIR:?INSTALL_DIR must be set}" "${VENV_DIR:?VENV_DIR must be set}"
 
-for m in setuptools-compat unified-memory-free; do
+for m in setuptools-compat unified-memory-free gb10-te-bf16; do
   (
     # shellcheck disable=SC1091
     source /opt/spark/mods/_lib/mod_common.sh

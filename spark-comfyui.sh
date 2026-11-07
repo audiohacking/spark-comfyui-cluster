@@ -322,6 +322,19 @@ MOUNTS_CONF="${MOUNTS_CONF:-$BASE_DIR/spark-mounts.conf}"
 # dgx-monarch's cluster.toml, mounted read-only where dgxm looks for it;
 # 'cluster init' seeds a container-mode template.
 CLUSTER_CONF="${CLUSTER_CONF:-$BASE_DIR/spark-cluster.toml}"
+# --- The validated stack ------------------------------------------------------
+# What every Spark of this cluster builds and runs unless spark-comfyui.env (or
+# the environment) says otherwise: the exact sources the dgx-monarch patches in
+# container/ were written against and the cluster's renders were verified on
+# (latent hashes, cross-rank identity, the Continuity overlay). Set
+# COMFY_REF=master, MONARCH_REF=main or CONTINUITY_REF= (empty) to follow
+# upstream instead; the build then fails loudly if a patch no longer applies.
+: "${COMFY_REF=v0.43.0}"
+: "${CONTINUITY_REF=00a9a8fe699232704b65d835ebaf80111c27fb99}"
+: "${MONARCH_REF=14d7e902ecc21f8b7c4d42f59e76323b008de507}"
+# Full-precision VAE: the validated renders decode with it.
+export SPARK_BF16_VAE="${SPARK_BF16_VAE-0}"
+
 # Which dgx-monarch to bake in. Empty means the newest vX.Y.Z release tag,
 # resolved at every build like ComfyUI master is, so 'update' moves it and
 # :previous / keep-* snapshot it. Any ref works (MONARCH_REF=main follows the
@@ -2162,6 +2175,12 @@ build the cluster image first: $0 update   (or SPARK_CLUSTER=0 to run stand-alon
     || CRUN_ARGS+=(-e "SPARK_MONARCH_ATTENTION=$SPARK_MONARCH_ATTENTION")
   [[ -z "${SPARK_ENCODE_REUSE:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_ENCODE_REUSE=$SPARK_ENCODE_REUSE")
+  [[ -z "${SPARK_TE_CACHE:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_TE_CACHE=$SPARK_TE_CACHE")
+  [[ -z "${SPARK_TE_COMPUTE:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_TE_COMPUTE=$SPARK_TE_COMPUTE")
+  [[ -z "${SPARK_TE_CACHE_MB:-}" ]] \
+    || CRUN_ARGS+=(-e "SPARK_TE_CACHE_MB=$SPARK_TE_CACHE_MB")
   [[ -z "${SPARK_VIDEO_REF_SIZE:-}" ]] \
     || CRUN_ARGS+=(-e "SPARK_VIDEO_REF_SIZE=$SPARK_VIDEO_REF_SIZE")
   [[ -z "${SPARK_FACE_ON_CLUSTER:-}" ]] \
@@ -3425,8 +3444,14 @@ cluster_push() {
       docker save "$CONTAINER_IMAGE:latest" | _cluster_ssh "$dest" docker load >/dev/null \
         || die "image transfer to $dest failed"
       rid="$(_cluster_ssh "$dest" docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
-      [[ "$rid" == "$lid" ]] \
-        || die "$dest reports image ${rid:7:12} after the load, expected ${lid:7:12}"
+      if [[ "$rid" != "$lid" ]]; then
+        [[ "$(_cluster_ssh "$dest" docker info -f "'{{.Driver}}'" 2>/dev/null)" == overlayfs ]] \
+          && die "$dest reports image ${rid:7:12} after the load, expected ${lid:7:12}: its Docker uses the
+containerd image store, which gives the same image another ID. Switch it to the
+classic store the other Sparks use, then push again:
+  ssh $dest 'echo {\"features\": {\"containerd-snapshotter\": false}} | sudo tee /etc/docker/daemon.json && sudo systemctl restart docker'"
+        die "$dest reports image ${rid:7:12} after the load, expected ${lid:7:12}"
+      fi
       info "loaded; $dest now runs the same image (old one kept as :previous)"
     fi
     if (( do_restart )); then
@@ -3441,10 +3466,15 @@ cluster_push() {
   log "Every listed host has image ${lid:7:12}"
 }
 
+# What every Spark must agree on beyond the image, one line per host: kernel,
+# ConnectX-7 firmware, Docker image store, active swap devices, and whether
+# NVIDIA's ConnectX firmware manager is armed to reflash the NIC at boot.
+_CLUSTER_HOST_PROBE='printf "kernel=%s cx7=%s docker=%s swap=%s nic-fw-manager=%s" "$(uname -r)" "$(cat /sys/class/infiniband/rocep1s0f0/fw_ver 2>/dev/null || echo none)" "$(docker info -f "{{.Driver}}" 2>/dev/null)" "$(swapon --noheadings --show=NAME 2>/dev/null | wc -l)" "$(s=$(systemctl is-enabled nvidia-spark-mlnx-firmware-manager 2>/dev/null); echo "${s:-absent}")"'
+
 cluster_status() {
   need_docker
   _need_cluster
-  local lid msha row rows name user dest rid rmsha state line
+  local lid msha row rows name user dest rid rmsha state line base rbase
   hdr "Cluster ($CLUSTER_CONF)"
   lid="$(docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null || true)"
   msha="$(docker image inspect -f '{{index .Config.Labels "org.spark-comfyui.monarch-sha"}}' \
@@ -3460,10 +3490,19 @@ cluster_status() {
   state="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' \
              "$WORKER_NAME" 2>/dev/null || echo "not created")"
   echo "  this Spark: ${row:-no [[hosts]] entry matches} — worker $state"
+  base="$(bash -c "$_CLUSTER_HOST_PROBE" 2>/dev/null)"
+  echo "  host baseline: $base"
   rows="$(_cluster_remote_rows)"
   while IFS=$'\t' read -r name _ user; do
     [[ -n "$name" ]] || continue
     dest="$(_cluster_dest "$name" "$user")"
+    rbase="$(_cluster_ssh "$dest" "$_CLUSTER_HOST_PROBE" 2>/dev/null </dev/null || true)"
+    if [[ -n "$rbase" && "$rbase" != "$base" ]]; then
+      warn "$name host differs from this Spark: $rbase
+  Every Spark should run the same kernel, ConnectX firmware and Docker image
+  store, with swap off and NVIDIA's ConnectX firmware manager disabled (it can
+  reflash the NIC at boot and its tool has crashed a kernel mid-render)."
+    fi
     rid="$(_cluster_ssh "$dest" docker image inspect -f '{{.Id}}' "$CONTAINER_IMAGE:latest" 2>/dev/null </dev/null || true)"
     state="$(_cluster_ssh "$dest" docker inspect -f "'{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}'" \
                "$WORKER_NAME" 2>/dev/null </dev/null || echo "unknown")"

@@ -162,7 +162,7 @@ Set at `run` or `service` time.
 | `SPARK_ATTENTION` | `sage` | Attention backend: `sage`, `sdpa`, or `ck` for upstream's Comfy Kitchen INT8. Whichever you pick is verified with a real kernel run before the server starts, and a failure refuses to launch rather than quietly serving on another backend. |
 | `SPARK_RESERVE_VRAM` | unset | Keeps that many GB of the unified pool free. Hardens against the overcommit freeze when pushing large models, and leaves room for a co-resident process. |
 | `SPARK_BF16` | `1` | The bf16 fast path. `0` disables it. |
-| `SPARK_BF16_VAE` | `1` | Keeps the fast path but takes the VAE off bf16 when set to `0`. |
+| `SPARK_BF16_VAE` | `0` | `0` decodes with the full-precision VAE (the validated setting); `1` keeps the VAE on bf16 too. |
 | `SPARK_STATIC_VRAM` | `0` | `1` disables DynamicVRAM. |
 | `SHM_SIZE` | `16g` | The container's `/dev/shm` ceiling. The Spark figure for large tensor transfers. |
 | `PORT` | `8182` | Host port. Upstream uses 8188; this fork moves off it so both can run on one Spark. Inside the container ComfyUI still listens on 8188. |
@@ -192,17 +192,16 @@ The VAE one has a flag form, `--no-bf16-vae`, which works with any command:
 | `TORCH_VERSION` | `2.14.0` | Pinned so a PyTorch release can never change your stack without you asking. |
 | `TORCHVISION_VERSION` | `0.29.0` | Pinned alongside torch. |
 | `TORCHAUDIO_VERSION` | `2.11.0` | Pinned alongside torch. |
-| `COMFY_REF` | upstream `master` | ComfyUI to build: a full 40-character commit sha, a tag or a branch. Set it in `spark-comfyui.env` to keep every build on a version you have tested. |
-| `CONTINUITY_REF` | not pinned | Continuity commit, tag or branch. On every start each container moves its existing Continuity checkout in `custom_nodes` to this ref. A checkout with local edits is left alone, and nothing is cloned. |
+| `COMFY_REF` | `v0.43.0` | ComfyUI to build: a full 40-character commit sha, a tag or a branch. `master` follows upstream. |
+| `CONTINUITY_REF` | `00a9a8f…` | Continuity commit, tag or branch (empty: leave the checkout as it is). On every start each container moves its existing Continuity checkout in `custom_nodes` to this ref. A checkout with local edits is left alone, and nothing is cloned. |
 
 `doctor` tells you when a newer torch is on the index, and `update --torch` builds against it, ignoring the pin. If that passes `doctor` and a generation, move the pin.
 
-To pin a tested stack, put the pins in `spark-comfyui.env` on every Spark (dgx-monarch's is `MONARCH_REF`, see Clustering → Settings), then run `install` and, in cluster mode, `cluster push`:
+The defaults are the stack this cluster was validated on: ComfyUI, Continuity and dgx-monarch (`MONARCH_REF`, see Clustering → Settings) at the exact versions the image's patches are written against. A fresh clone builds exactly that. To move a pin, set it in `spark-comfyui.env` on every Spark, then run `update` and, in cluster mode, `cluster push`. A patch that no longer applies to the new version fails the build rather than shipping without it.
 
 ```bash
-COMFY_REF=250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a
-CONTINUITY_REF=00a9a8fe699232704b65d835ebaf80111c27fb99
-MONARCH_REF=v1.3.0
+COMFY_REF=master          # follow upstream ComfyUI
+MONARCH_REF=main          # follow dgx-monarch's branch head
 ```
 
 ### Disk
@@ -553,80 +552,125 @@ dgx-monarch's example workflows appear under **Workflow → Browse Templates**. 
 
 A render spreads over every Spark in `spark-cluster.toml`, whatever their number. With `topology = auto` (what Continuity uses), two Sparks split it in two as before, and three or more split it across all of them. A model whose attention-head count the number of Sparks doesn't divide (MiniMax H3 has 56 heads, so 3, 5 or 6 Sparks) still runs: a few attention heads are computed twice and the duplicates dropped, which leaves the output unchanged and costs about 2% more attention work on 3 Sparks.
 
-The new Spark is `192.0.2.12` below. Run the commands on the driver unless a step says otherwise.
+`NEW` below is the new Spark's fabric address. Run the commands on the driver unless a step says otherwise.
 
-**1. Fabric.** Connect the new Spark to the fabric. Every Spark must reach every other one, because each render exchanges data between all pairs: on a switch that means one more port in the same subnet. Then check from the driver and from each worker:
+**1. Fabric.** Every Spark must reach every other one over the 100G fabric, because each render exchanges data between all pairs.
+
+- *On a switch:* one more port in the same subnet.
+- *Three Sparks without a switch (a ring):* cable each Spark's port 0 to the next one's port 1, and let NVIDIA's network setup address the cables. It gives every cable its own subnets (one per half of the port), so each Spark only knows the addresses on its own two cables. Add a route file on **every** Spark that sends the other cable's addresses straight over the direct cable to their owner, for example on the Spark whose port 1 is `FABRIC_IP` and port 0 `FABRIC_IP`:
+
+  ```yaml
+  # /etc/netplan/98-spark-fabric-routes.yaml (mode 600), then: sudo netplan apply
+  network:
+    version: 2
+    renderer: NetworkManager
+    ethernets:
+      enp1s0f1np1:   {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
+      enP2p1s0f1np1: {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
+      enp1s0f0np0:   {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
+      enP2p1s0f0np0: {routes: [{to: FABRIC_IP/32, via: FABRIC_IP}]}
+  ```
+
+  If NVIDIA's setup runs again it may disable this file; check it is still in `/etc/netplan`.
+
+Then check from every Spark that each other Spark's addresses answer **through a fabric port**, never the management NIC or VPN:
 
 ```bash
-ping -c2 192.0.2.12
+ping -c2 NEW
+ip route get NEW        # dev enp1s0f… or enP2p1s0f…, not enP7s7 or vpn0
 ```
 
 Add the new address to the fabric's source restrictions ([Before you start](#before-you-start), item 5).
 
-**2. Stand-alone first** (on the new Spark). Clone this repo at the same path as on the others, copy the same `spark-comfyui.env` and `spark-mounts.conf`, then:
+**2. The same host as the others** (on the new Spark). Renders run in lockstep on every Spark, so the hosts must match, not just the image:
+
+```bash
+uname -r                                          # same kernel as the other Sparks
+cat /sys/class/infiniband/rocep1s0f0/fw_ver       # same ConnectX-7 firmware
+sudo systemctl disable --now nvidia-spark-mlnx-firmware-manager  # it can reflash the NIC at boot
+echo '{"features": {"containerd-snapshotter": false}}' | sudo tee /etc/docker/daemon.json \
+  && sudo systemctl restart docker                # the image store the other Sparks use
+sudo usermod -aG docker "$USER"                   # then log in again
+```
+
+A fresh DGX OS install can come with a newer kernel and NIC firmware than Sparks set up earlier. Install the others' kernel and pin it in GRUB, and flash the others' ConnectX firmware with `mstflint`, before the Spark joins.
+
+**3. Stand-alone first** (on the new Spark). Clone this repo at the same path as on the others, copy the same `spark-comfyui.env` and `spark-mounts.conf`, then:
 
 ```bash
 ./spark-comfyui.sh install
-./spark-comfyui.sh doctor            # every line PASS
+./spark-comfyui.sh tune --clock-cap 2300 --persist   # the same tuning as the others
+./spark-comfyui.sh doctor                            # every line PASS
 ```
 
-**3. The same content.** Install the same custom nodes as on the other Sparks (the same `comfyui-nodes.list`, plus `recipe install`). After step 5 the models can be checked and copied from the driver:
+**4. The same content.** Install the same custom nodes as on the other Sparks (the same `comfyui-nodes.list`, plus `recipe install`). After step 6 the models can be checked and copied from the driver:
 
 ```bash
 ./spark-comfyui.sh cluster models list --missing
 ./spark-comfyui.sh cluster models sync '*'
 ```
 
-**4. ssh.** The cluster key on the new Spark, the new address as a known host for that key, and your own passwordless ssh to it:
+**5. ssh.** The cluster key on the new Spark, the new address as a known host for that key, and your own passwordless ssh to it:
 
 ```bash
-ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub you@192.0.2.12   # or the key ssh_key names
-ssh-keyscan -H 192.0.2.12 >> ~/.ssh/spark-comfyui-cluster/known_hosts
-ssh 192.0.2.12 docker info >/dev/null && echo ok
+ssh-copy-id -i ~/.ssh/spark-comfyui-cluster/id_ed25519.pub you@NEW   # or the key ssh_key names
+ssh-keyscan -H NEW >> ~/.ssh/spark-comfyui-cluster/known_hosts
+ssh NEW docker info >/dev/null && echo ok
 ```
 
-**5. The config.** Add a `[[hosts]]` block for the new Spark at the end of `spark-cluster.toml` (the driver stays first), and copy the file to every Spark:
+**6. The config.** Add a `[[hosts]]` block for the new Spark at the end of `spark-cluster.toml` (the driver stays first), and copy the file to every Spark:
 
 ```toml
 [[hosts]]
-name = "192.0.2.12"
-address = "tcp://192.0.2.12:26600"
+name = "NEW"
+address = "tcp://NEW:26600"
 gpus = 1
 ssh_user = "you"
 ```
 
 ```bash
-for h in 192.0.2.11 192.0.2.12; do scp -p spark-cluster.toml "$h":~/Documents/ComfyUI/spark-comfyui-cluster/; done
+for h in OTHER_SPARKS NEW; do scp -p spark-cluster.toml "$h":~/Documents/ComfyUI/spark-comfyui-cluster/; done
 ```
 
-If the new Spark's NIC names differ from the others', the `[fabric.generic-roce]` names must still match on every Spark: dgx-monarch applies one set to all of them.
+The `[fabric.generic-roce]` NIC names apply to every Spark, so they must be the same on all of them. In a ring, address each Spark by its port-1 address (`enp1s0f1np1`, so the socket interfaces below find it) and let NCCL use all four port halves, pairing each with the peer on its own subnet:
 
-**6. The image.** Send the driver's exact image to the new Spark. This also starts its worker:
+```toml
+[fabric.generic-roce]
+NCCL_SOCKET_IFNAME = "enp1s0f1np1"
+GLOO_SOCKET_IFNAME = "enp1s0f1np1"
+NCCL_IB_HCA        = "rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1"
+NCCL_IB_SUBNET_AWARE_ROUTING = "1"
+NCCL_IB_MERGE_NICS = "0"
+NCCL_NET_GDR_LEVEL = "SYS"
+UCX_NET_DEVICES    = "enp1s0f1np1"
+```
+
+**7. The image.** Send the driver's exact image to the new Spark. This also starts its worker:
 
 ```bash
-./spark-comfyui.sh cluster push 192.0.2.12
+./spark-comfyui.sh cluster push NEW
 ```
 
-**7. Restart the whole cluster**, so the driver and every worker agree on the new size:
+**8. Restart the whole cluster**, so the driver and every worker agree on the new size:
 
 ```bash
 ./spark-comfyui.sh stop
 ./spark-comfyui.sh cluster worker --restart                                        # on the driver
-ssh 192.0.2.11 ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart
-ssh 192.0.2.12 ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart
+ssh OTHER_SPARK ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart   # each other Spark
+ssh NEW ~/Documents/ComfyUI/spark-comfyui-cluster/spark-comfyui.sh cluster worker --restart
 ./spark-comfyui.sh service
 ```
 
-**8. Check:**
+**9. Check:**
 
 ```bash
-./spark-comfyui.sh cluster status       # every host: worker healthy, SAME image ID and monarch commit
+./spark-comfyui.sh cluster status       # every host: worker healthy, SAME image, no "host differs" warning
 ./spark-comfyui.sh cluster dgxm doctor  # all green
 ```
 
-The first render after the change runs dgx-monarch's first-use identity check again, because the split is new, so it takes longer than the ones after it. During sampling, `./spark-comfyui.sh cluster dgxm top` shows GPU load on every host.
+`cluster status` compares every Spark's kernel, ConnectX firmware, Docker image store, swap and NIC firmware manager with the driver's and warns about any difference. The first render after the change runs dgx-monarch's first-use identity check again, because the split is new, so it takes longer than the ones after it. During sampling, `./spark-comfyui.sh cluster dgxm top` shows GPU load on every host.
 
-To take a Spark out again, delete its `[[hosts]]` block on every Spark, run `cluster worker --disable` on it, and restart the rest as in step 7.
+To take a Spark out again, delete its `[[hosts]]` block on every Spark, run `cluster worker --disable` on it, and restart the rest as in step 8.
 
 ### Quick test: one Spark, then two
 
@@ -762,7 +806,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | Roll back both | `update --rollback`, then `cluster push` |
 | Keep a known-good pair | `update --keep=h3-ok` pins the image you leave as `:keep-h3-ok` |
 | Follow dgx-monarch's main branch | `MONARCH_REF=main ./spark-comfyui.sh update`, then `cluster push` |
-| Pin an exact dgx-monarch | `MONARCH_REF=v1.3.0` (any tag, branch or commit) |
+| Pin an exact dgx-monarch | `MONARCH_REF=<tag, branch or commit>` (default: the validated commit) |
 | Pin ComfyUI and Continuity | `COMFY_REF` and `CONTINUITY_REF` in `spark-comfyui.env` on every Spark (see Build pins) |
 | Add a Spark | Add a `[[hosts]]` block, copy the file everywhere, `cluster push <ip>`, then restart the driver |
 | Restart a worker | `cluster worker --restart` on that Spark |
@@ -797,7 +841,7 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 |---|---|---|
 | `CLUSTER_CONF` | `spark-cluster.toml` | The cluster switch and dgx-monarch's `cluster.toml`. |
 | `SPARK_CLUSTER` | unset | `0` forces stand-alone even with the file present. |
-| `MONARCH_REF` | newest `vX.Y.Z` | dgx-monarch tag, branch or commit to build. |
+| `MONARCH_REF` | `14d7e90…` | dgx-monarch tag, branch or commit to build. Empty: the newest `vX.Y.Z` release. |
 | `MONARCH_REPO` | upstream | dgx-monarch git URL, for a fork. |
 | `CLUSTER_SSH_DIR` | `~/.ssh/$CONTAINER_NAME` | The driver container's ssh identity. |
 | `WORKER_NAME` | `<CONTAINER_NAME>-worker` | This Spark's worker container. |
@@ -810,7 +854,10 @@ In cluster mode, [Continuity](https://github.com/roadmaus/ComfyUI-Continuity)'s 
 | `SPARK_MONARCH_RELEASE_ON_SWITCH` | `1` | When a Continuity render asks for a different diffusion model than the cluster holds, the workers are reset first (about a minute) so the previous model's memory is free. `0` keeps it loaded. |
 | `SPARK_MONARCH_FREE_BEFORE` | `1` | Right before a Continuity render samples on the cluster, the driver's ComfyUI unloads its idle models (text encoder, VAEs) and the workers free their allocator caches, so long renders and large reference videos have the memory. Unloaded models reload when needed. `0` keeps them loaded. |
 | `SPARK_FACE_ON_CLUSTER` | `1` | Continuity's face pass samples its crop on the cluster when it uses the checkpoint and LoRA stack the main pass loaded there; detection, masks and the composite stay on the driver. Anything else, or a cluster that cannot take it, samples on the driver as before. `0` keeps it on the driver. |
-| `SPARK_ENCODE_REUSE` | `1` | Continuity's face pass reuses the main pass's text-encoder output and cached reference latents instead of encoding them again. `0` lets it encode on its own. |
+| `SPARK_TE_CACHE` | `1` | Text-encoder results are kept in memory and reused when the same encoder gets the same inputs again (a re-roll that changes only the seed, a second pass on the same prompt). Bit-identical to encoding again; any workflow. `0` turns it off. |
+| `SPARK_TE_CACHE_MB` | `4096` | Memory the text-encoder cache may use; the least recently used results go first. |
+| `SPARK_TE_COMPUTE` | `bf16` | Precision the decoder-LLM text encoders (Qwen3-VL for MiniMax H3, Qwen, Llama) compute in on the GB10: `bf16` runs them on the tensor cores (about 4x faster for H3's encoder), `fp32` is stock ComfyUI. Other encoders (CLIP, T5) always use fp32. |
+| `SPARK_ENCODE_REUSE` | `1` | Continuity's face pass finds the main pass's cached reference latents instead of encoding them again. `0` lets it encode on its own. |
 | `SPARK_VIDEO_REF_SIZE` | `match` | The size a Continuity reference video encodes at when none was picked for it: `match` takes the generation's own size (fewer rows, faster), `max` Continuity's 768-short-edge reference canvas. A clip whose size was picked in the editor keeps it. |
 | `SPARK_MONARCH_ATTENTION` | `SAGE_AUTO` | The attention kernel Continuity's cluster renders use when the node's attention is 'default': SageAttention, as the driver's own passes use. `TORCH_FLASH` keeps exact attention (slower); any other dgx-monarch kernel name works too. |
 | `SPARK_MONARCH_NOTICES` | essentials | dgx-monarch's pop-up notices in ComfyUI: only warnings and errors by default. `all` shows every notice; all of them stay in the DGX Monarch panel either way. |

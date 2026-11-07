@@ -546,6 +546,7 @@ COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/monarch_preview.py \
      container/spark-continuity-monarch/encode_reuse.py \
      container/spark-continuity-monarch/face_route.py \
+     container/spark-continuity-monarch/te_cache.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/
