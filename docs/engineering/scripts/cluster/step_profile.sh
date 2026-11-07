@@ -9,17 +9,21 @@
 set -euo pipefail
 HOSTS=(FABRIC_IP FABRIC_IP FABRIC_IP)
 DIR=.local/state/spark-comfyui-cluster/.cache/dgx-monarch
+# This Spark is reached directly: ssh to its own fabric address has no known host key.
+here() { ip -o -4 addr show | grep -qw "inet $1"; }
+on() { local h=$1; shift; if here "$h"; then bash -c "$*"; else ssh -o BatchMode=yes "$h" "$*"; fi; }
 cmd=${1:?request|collect}; id=${2:?id}
 case "$cmd" in
   request)
     step=${3:-3}
     for h in "${HOSTS[@]}"; do
-      ssh -o BatchMode=yes "$h" "printf '{\"id\": \"%s\", \"step\": %d}\n' '$id' $step > ~/$DIR/step-profile.request && echo \"$h: requested $id step $step\""
+      on "$h" "printf '{\"id\": \"%s\", \"step\": %d}\n' '$id' $step > ~/$DIR/step-profile.request && echo \"$h: requested $id step $step\""
     done ;;
   collect)
     dest=${3:?dest}; mkdir -p "$dest"
     for h in "${HOSTS[@]}"; do
-      scp -o BatchMode=yes -q "$h:$DIR/step-profile/$id-*" "$dest/" && echo "$h: collected"
+      if here "$h"; then cp ~/"$DIR"/step-profile/"$id"-* "$dest/"; else
+        scp -o BatchMode=yes -q "$h:$DIR/step-profile/$id-*" "$dest/"; fi && echo "$h: collected"
     done ;;
   *) echo "usage: $0 request ID [STEP] | collect ID DEST" >&2; exit 2 ;;
 esac

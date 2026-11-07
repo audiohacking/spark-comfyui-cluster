@@ -3317,6 +3317,7 @@ ssh_user = "$(id -un)"
 # GLOO_SOCKET_IFNAME = "enp1s0f0np0"
 # NCCL_IB_HCA = "rocep1s0f0,roceP2p1s0f0"
 # NCCL_NET_GDR_LEVEL = "SYS"     # GB10 has no GPUDirect RDMA
+# NCCL_IB_GID_INDEX = "-1"       # NCCL picks each NIC's RoCE v2 GID (its index differs per NIC)
 # UCX_NET_DEVICES = "enp1s0f0np0"
 
 # ComfyUI settings applied in every actor process (Init-node widgets win):

@@ -509,6 +509,7 @@ NCCL_SOCKET_IFNAME = "enp1s0f0np0"
 GLOO_SOCKET_IFNAME = "enp1s0f0np0"
 NCCL_IB_HCA        = "rocep1s0f0,roceP2p1s0f0"
 NCCL_NET_GDR_LEVEL = "SYS"   # GB10 has no GPUDirect RDMA
+NCCL_IB_GID_INDEX  = "-1"    # let NCCL pick each NIC's RoCE v2 address (its index differs per NIC)
 UCX_NET_DEVICES    = "enp1s0f0np0"
 ```
 
@@ -632,7 +633,7 @@ ssh_user = "you"
 for h in OTHER_SPARKS NEW; do scp -p spark-cluster.toml "$h":~/Documents/ComfyUI/spark-comfyui-cluster/; done
 ```
 
-The `[fabric.generic-roce]` NIC names apply to every Spark, so they must be the same on all of them. In a ring, address each Spark by its port-1 address (`enp1s0f1np1`, so the socket interfaces below find it) and let NCCL use all four port halves, pairing each with the peer on its own subnet:
+The `[fabric.generic-roce]` NIC names apply to every Spark, so they must be the same on all of them. In a ring, address each Spark by its port-1 address (`enp1s0f1np1`, so the socket interfaces below find it) and let NCCL use all four port halves, pairing each with the peer on its own subnet. `NCCL_IB_GID_INDEX = "-1"` is required here: the RoCE v2 address sits at index 3 on some NICs and 4 on others, and the profile's fixed index 3 makes NCCL connect NICs whose cables don't reach each other (`ibv_modify_qp ... Connection timed out`):
 
 ```toml
 [fabric.generic-roce]
@@ -642,6 +643,7 @@ NCCL_IB_HCA        = "rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1"
 NCCL_IB_SUBNET_AWARE_ROUTING = "1"
 NCCL_IB_MERGE_NICS = "0"
 NCCL_NET_GDR_LEVEL = "SYS"
+NCCL_IB_GID_INDEX  = "-1"
 UCX_NET_DEVICES    = "enp1s0f1np1"
 ```
 

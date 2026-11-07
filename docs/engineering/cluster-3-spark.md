@@ -154,3 +154,48 @@ Open question: the 2-Spark main pass took 302 s for 57 latent frames, and the
 Per-step time barely followed the shorter video or the extra Spark, so part of
 each step's cost may not scale. Running the same job on 2 and on 3 Sparks
 would settle it.
+
+## Where a sampling step went, and the slow Spark (2026-11-07/08)
+
+A one-step torch profile on every rank (patch `monarch-step-profile`, request
+with `scripts/cluster/step_profile.sh`, read with `analyze_step_trace.py`) of a
+face pass (39,621 rows, 13,207 per rank) showed every GPU 99.6-99.9% busy, so
+nothing was launch-bound. Per DiT block (50 per step, ~385 ms):
+
+| | ms per block |
+|---|---|
+| NCCL all-to-all (4 per block, Ulysses q/k/v/out) | 152-173 |
+| Sage attention (int8 QK, fp8 PV) | 93-105 |
+| int8 GEMMs (Triton, 4 per block) | 56-62 |
+| copies, cat, transpose (Ulysses pack/unpack, 57-head padding) | 31-34 |
+| quantize, norm, RoPE, elementwise | ~30 |
+
+Compute (~10.7 s per step) matched a single-GB10 H3 profile scaled to our
+per-rank shapes (newjordan/h3-spark: attention ~164-180 TOPS on both). The
+all-to-all moved 128 MB out of each rank in ~39 ms: 25 Gb/s, with no overlap.
+
+`scripts/cluster/a2a_bench.py` (one process per Spark in the worker
+containers, `a2a_bench.sh`) reproduced it outside a render: 41 ms at the
+traced shape, linear in size (a bandwidth wall), and no NCCL setting moved it
+(channels, QPs per connection, buffer and chunk sizes, protocol, GDR level).
+Its p2p/bidir/ring modes then showed every transfer *from* spark-b at
+~13-16 Gb/s and every other direction at 90-100 Gb/s; raw `ib_write_bw`,
+`ib_read_bw` responses and TCP agreed. Cables, FEC, error and pause counters,
+NIC firmware configuration (mstconfig), QoS, IOMMU mode, PCIe width/speed/MPS/
+MRRS, memory bandwidth, clocks and temperatures were identical. The one
+difference: Device Control 2 on B's NIC root ports read 0x0020 (LTR off)
+against 0x0420 on the others. Secure Boot lockdown refuses `setpci`, so B
+was rebooted: LTR on, 92.4 Gb/s RDMA and 91.5 Gb/s TCP out, all-to-all
+41 -> 6.2 ms (166 Gb/s out per rank).
+
+After that reboot:
+- B's boot stalled on `plymouth-quit-wait`, so `comfyui-tune` (swap off)
+  and `gb10-clock-cap` waited; `sudo plymouth quit` released them. Check
+  `systemctl is-system-running` after rebooting a Spark.
+- The next render failed at its first collective: `ibv_modify_qp failed with
+  110 Connection timed out ... local GID ::ffff:FABRIC_IP, remote GID
+  ::ffff:FABRIC_IP`. dgx-monarch's `generic-roce` profile pins
+  `NCCL_IB_GID_INDEX=3`, but the RoCE v2 IPv4 GID sits at index 4 on some NICs
+  (A's port-1 halves, C's port-0 halves), so NCCL paired NICs whose
+  cables do not reach each other. `NCCL_IB_GID_INDEX = "-1"` in the fabric
+  section lets NCCL choose per connection: 6.1 ms, every rank even.
