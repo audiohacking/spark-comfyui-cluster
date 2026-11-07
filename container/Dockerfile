@@ -561,6 +561,7 @@ COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/face_route.py \
      container/spark-continuity-monarch/te_cache.py \
      container/spark-continuity-monarch/vae_cache.py \
+     container/spark-continuity-monarch/output_formats.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/

@@ -164,6 +164,7 @@ Set at `run` or `service` time.
 | `SPARK_BF16` | `1` | The bf16 fast path. `0` disables it. |
 | `SPARK_BF16_VAE` | `0` | `0` decodes with the full-precision VAE (the validated setting); `1` keeps the VAE on bf16 too. |
 | `SPARK_STATIC_VRAM` | `0` | `1` disables DynamicVRAM. |
+| `SPARK_ASSETS` | `1` | ComfyUI's asset system (`--enable-assets`): the Assets panel lists every generated file, also after a restart. Files are listed, not hashed. `0` turns it off. |
 | `SHM_SIZE` | `16g` | The container's `/dev/shm` ceiling. The Spark figure for large tensor transfers. |
 | `PORT` | `8182` | Host port. Upstream uses 8188; this fork moves off it so both can run on one Spark. Inside the container ComfyUI still listens on 8188. |
 | `BIND_ADDR` | unset | Host interface the port is published on. Empty is docker's own behaviour and means every interface, because a Spark is a headless box you reach from a laptop. |

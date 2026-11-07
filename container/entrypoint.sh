@@ -585,6 +585,13 @@ if [[ "${SPARK_BF16:-1}" == "1" ]]; then
     info "bf16 VAE disabled (SPARK_BF16_VAE=0) — needed for LTX-2.3 audio workflows"
   fi
 fi
+# ComfyUI's asset system indexes the output, input and models folders into a
+# database in the user directory, so the Assets panel lists every generated file,
+# also after a restart (the job history lives in memory and does not). Content
+# hashing stays off, so indexing only lists files. SPARK_ASSETS=0 turns it off.
+if [[ "${SPARK_ASSETS:-1}" == "1" ]]; then
+  extra_flags+=(--enable-assets)
+fi
 if [[ "${SPARK_STATIC_VRAM:-0}" == "1" ]]; then
   extra_flags+=(--disable-dynamic-vram)
 fi

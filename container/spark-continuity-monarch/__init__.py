@@ -20,9 +20,11 @@ from . import face_route
 from . import monarch_preview
 from . import te_cache
 from . import vae_cache
+from . import output_formats
 
 te_cache.install()  # every workflow's text encodes, Continuity or not
 vae_cache.install()  # every workflow's VAE encodes, Continuity or not
+output_formats.install()  # Continuity's saved files show up in the queue and assets
 
 # Built only inside Continuity's expanded graph (continuity_monarch.py).
 NODE_CLASS_MAPPINGS = {monarch_preview.NODE_ID: monarch_preview.SparkMonarchPreview,

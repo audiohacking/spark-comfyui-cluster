@@ -2098,6 +2098,7 @@ the calling uid, and root would write root-owned files into your content"
     -e SPARK_BF16
     -e SPARK_BF16_VAE
     -e SPARK_STATIC_VRAM
+    -e SPARK_ASSETS
     -e SPARK_RESERVE_VRAM
     -e SPARK_ATTENTION
   )
