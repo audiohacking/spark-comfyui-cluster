@@ -3311,14 +3311,16 @@ ssh_user = "$(id -un)"
 # gpus = 1
 # ssh_user = "$(id -un)"
 
-# generic-roce sets only NCCL_IB_GID_INDEX and NCCL_DEBUG. Name your NICs
-# (check with: ibdev2netdev, ip -br link):
-# [fabric.generic-roce]
+# generic-roce on its own sets only NCCL_DEBUG and a fixed GID index (3),
+# which fails ("ibv_modify_qp ... Connection timed out") on a NIC whose RoCE v2
+# GID sits elsewhere; -1 lets NCCL pick each NIC's own. Name your NICs below
+# (check with: ibdev2netdev, ip -br link).
+[fabric.generic-roce]
+NCCL_IB_GID_INDEX = "-1"
+NCCL_NET_GDR_LEVEL = "SYS"       # GB10 has no GPUDirect RDMA
 # NCCL_SOCKET_IFNAME = "enp1s0f0np0"
 # GLOO_SOCKET_IFNAME = "enp1s0f0np0"
 # NCCL_IB_HCA = "rocep1s0f0,roceP2p1s0f0"
-# NCCL_NET_GDR_LEVEL = "SYS"     # GB10 has no GPUDirect RDMA
-# NCCL_IB_GID_INDEX = "-1"       # NCCL picks each NIC's RoCE v2 GID (its index differs per NIC)
 # UCX_NET_DEVICES = "enp1s0f0np0"
 
 # ComfyUI settings applied in every actor process (Init-node widgets win):
