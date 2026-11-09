@@ -21,6 +21,7 @@ from . import monarch_preview
 from . import te_cache
 from . import vae_cache
 from . import output_formats
+from . import mux_threads
 
 te_cache.install()  # every workflow's text encodes, Continuity or not
 vae_cache.install()  # every workflow's VAE encodes, Continuity or not
@@ -52,6 +53,7 @@ def _settle():
     its package not importable yet. Each step is idempotent."""
     monarch_preview.quiet_notices()
     vae_cache.install()  # back on top if dgx-monarch's encode split wrapped it since
+    mux_threads.install()  # Continuity may have loaded after this pack
     installed = continuity_monarch.install()
     if installed:
         monarch_preview.wrap_sampler()

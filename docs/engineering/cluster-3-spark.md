@@ -198,3 +198,21 @@ After that reboot:
   (A's port-1 halves, C's port-0 halves), so NCCL paired NICs whose
   cables do not reach each other. `NCCL_IB_GID_INDEX = "-1"` in the fabric
   section lets NCCL choose per connection: 6.1 ms, every rank even.
+
+## Fused small operations in the H3 block (`container/monarch-h3-block-fuse.patch`)
+
+Stock `DiTBlock.forward` launches its RMSNorm, adaLN multiply and add, and the
+gated residual as separate kernels, the modulation ones once per modulation
+segment. The rank holding the text rows launches thousands of them per step.
+Together they are 3.1-3.4% of a step's GPU time.
+
+The patch runs the same arithmetic in three kernels per block with a per-row
+modulation table, rounding to bf16 at the same points as stock and summing the
+RMSNorm in PyTorch's order. On torch 2.14, 216 synthetic cases (widths 1024-5376,
+1-600 rows, mixed integer and per-token segments, four input scales) matched
+stock bit for bit, comparing the raw bf16 bits. A block's small operations took
+0.22 ms against 0.57 ms at 600 rows.
+
+Each Worker process repeats a smaller version of that comparison with its own
+kernels on the first forward at a given width, and stays on stock if they differ
+or do not compile. `DGXM_H3_BLOCK_FUSE=off` turns the path off.

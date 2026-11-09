@@ -517,10 +517,13 @@ USER comfy
 # monarch-step-profile.patch: on request only (a step-profile.request file in
 # ~/.cache/dgx-monarch on each Spark), every rank records torch.profiler for
 # one sampling step; without the file the sampler runs exactly as before.
+# monarch-h3-block-fuse: MiniMax H3's norm, modulation, gate and residual as
+# three fused kernels per block, used only after a bit-for-bit check against
+# the stock operations in each process. DGXM_H3_BLOCK_FUSE=off turns it off.
 COPY --chown=comfy:0 container/monarch-preview-x0.patch container/monarch-h3-mask.patch \
      container/monarch-cancel-agree.patch container/monarch-slab-register.patch \
      container/monarch-ulysses-any-world.patch container/monarch-vae-encode-split.patch \
-     container/monarch-step-profile.patch /opt/spark/
+     container/monarch-step-profile.patch container/monarch-h3-block-fuse.patch /opt/spark/
 RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
     umask 002 \
  && git clone ${MONARCH_REPO} /opt/monarch-nodes/dgx-monarch \
@@ -539,6 +542,8 @@ RUN --mount=type=cache,target=/home/comfy/.cache/pip,uid=1000 \
       || { echo "monarch-vae-encode-split.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-step-profile.patch \
       || { echo "monarch-step-profile.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
+ && { git -C /opt/monarch-nodes/dgx-monarch apply /opt/spark/monarch-h3-block-fuse.patch \
+      || { echo "monarch-h3-block-fuse.patch does not apply to dgx-monarch ${MONARCH_SHA}; refresh it" >&2; exit 1; }; } \
  && xfw="$(mktemp -d)" \
  && python /opt/monarch-nodes/dgx-monarch/tools/build_xfuser_compat_wheel.py --output-dir "$xfw" \
  && pip install -e "/opt/monarch-nodes/dgx-monarch[tui]" \
@@ -562,6 +567,7 @@ COPY --chown=comfy:0 container/spark-continuity-monarch/__init__.py \
      container/spark-continuity-monarch/te_cache.py \
      container/spark-continuity-monarch/vae_cache.py \
      container/spark-continuity-monarch/output_formats.py \
+     container/spark-continuity-monarch/mux_threads.py \
      /opt/monarch-nodes/spark-continuity-monarch/
 COPY --chown=comfy:0 container/spark-continuity-monarch/example_workflows/ \
      /opt/monarch-nodes/spark-continuity-monarch/example_workflows/

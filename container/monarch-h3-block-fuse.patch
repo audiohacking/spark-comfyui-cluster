@@ -1,0 +1,525 @@
+diff --git a/src/dgx_monarch/actor/comfy_bridge.py b/src/dgx_monarch/actor/comfy_bridge.py
+index d633ade..da7f4ec 100644
+--- a/src/dgx_monarch/actor/comfy_bridge.py
++++ b/src/dgx_monarch/actor/comfy_bridge.py
+@@ -12,7 +12,7 @@ import sys
+ import time
+ from typing import Any, cast
+ 
+-from ..kernels import int8_gemm
++from ..kernels import h3_block_fuse, int8_gemm
+ from ..log import get_logger
+ from ..transfer_utils import (
+     failure_summary,
+@@ -385,6 +385,7 @@ def ensure_comfy(
+     comfy_dynamic.stage_b(dynamic, reserve_vram_gb=effective.get("reserve_vram_gb"))
+     if not custom_nodes_disabled:
+         _load_custom_node_modules()
++    h3_block_fuse.install()  # never raises; stock stays in place on any problem
+     log.info("comfy bootstrapped from %s", comfy_dir)
+ 
+ 
+diff --git a/src/dgx_monarch/cli/worker_process_env.py b/src/dgx_monarch/cli/worker_process_env.py
+index 1da3885..d74cec6 100644
+--- a/src/dgx_monarch/cli/worker_process_env.py
++++ b/src/dgx_monarch/cli/worker_process_env.py
+@@ -58,6 +58,7 @@ _SAFE_EXACT = frozenset({
+     "DGXM_NO_CUSTOM_NODES",
+     "DGXM_SKIP_NODE_PACKS",
+     "DGXM_SLAB_CERTIFY",
++    "DGXM_H3_BLOCK_FUSE",
+     # Fault injection requires both names and can only refuse a rank's load.
+     # Neither carries credentials or enables extra operations. An incomplete pair logs a
+     # warning and leaves loading unchanged (actor/load_fault.py).
+diff --git a/src/dgx_monarch/kernels/h3_block_fuse.py b/src/dgx_monarch/kernels/h3_block_fuse.py
+new file mode 100644
+index 0000000..2acc808
+--- /dev/null
++++ b/src/dgx_monarch/kernels/h3_block_fuse.py
+@@ -0,0 +1,240 @@
++"""MiniMax H3's DiTBlock.forward with its small operations fused.
++
++Stock runs the norms, adaLN modulation, gates and residuals as separate kernels,
++launching one set per modulation segment: a rank holding the text rows launches
++thousands per step. `h3_block_fuse_triton` does the same arithmetic in three
++kernels per block, indexed by a per-row table.
++
++Kernel replacement rules (docs/DESIGN.md section 4): identical output, an off
++switch, and the stock path whenever a prerequisite is missing. The first
++forward at a given width compiles the kernels and compares them bit for bit
++with the stock operations on small tensors in this very process; a difference
++or a compile failure leaves the process on stock with one warning. Attention
++and the MLP are the stock modules, called exactly as before.
++`DGXM_H3_BLOCK_FUSE=off` in the Worker's environment turns it off.
++"""
++from __future__ import annotations
++
++import functools
++import os
++
++from ..log import get_logger
++
++log = get_logger(__name__)
++
++ENV = "DGXM_H3_BLOCK_FUSE"
++
++
++class _State:
++    installed = False
++    checked: dict = {}
++    kernels = None
++    warned = 0
++    fused = 0
++    ridx_key = None
++    ridx = None
++
++
++_STATE = _State()
++
++
++def enabled() -> bool:
++    return os.environ.get(ENV, "").strip().lower() != "off"
++
++
++def _note(reason: str) -> None:
++    _STATE.warned += 1
++    if _STATE.warned <= 3:
++        log.warning("H3 block fusion: stock path, %s", reason)
++
++
++def _row_index(segments, rows, device):
++    """Per-row int32 modulation index, or None when `segments` do not cover the rows.
++
++    The blocks of one forward share one list, so the last table is kept; the key
++    holds the list itself, which stops its id being reused."""
++    import torch
++
++    key = _STATE.ridx_key
++    if key is not None and key[0] is segments and key[1] == rows and key[2] == device:
++        return _STATE.ridx
++    ordered = sorted(segments, key=lambda seg: seg[0])
++    position = 0
++    for start, stop, row in ordered:
++        if start != position or stop < start:
++            return None
++        if torch.is_tensor(row) and row.numel() != stop - start:
++            return None
++        position = stop
++    if position != rows:
++        return None
++    table = torch.empty(rows, dtype=torch.int32, device=device)
++    for start, stop, row in ordered:
++        table[start:stop] = (row.to(device=device, dtype=torch.int32) if torch.is_tensor(row)
++                             else int(row))
++    _STATE.ridx_key, _STATE.ridx = (segments, rows, device), table
++    return table
++
++
++def _both_blocks(model, kernels, x, weight, eps, segments, table, others, vectors):
++    """One block's arithmetic, stock against fused, on the same inputs."""
++    import torch.nn.functional as functional
++
++    width = x.shape[1]
++    shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = vectors
++    other_a, other_m = others
++    stock_x = x.clone()
++    stock_1 = model._mod_scale_shift(functional.rms_norm(stock_x, (width,), weight, eps),
++                                     shift_a, scale_a, segments)
++    model._mod_gate(stock_x, gate_a, other_a, segments)
++    stock_2 = model._mod_scale_shift(functional.rms_norm(stock_x, (width,), weight, eps),
++                                     shift_m, scale_m, segments)
++    model._mod_gate(stock_x, gate_m, other_m, segments)
++    fused_x = x.clone()
++    fused_1 = kernels.norm_mod(fused_x, weight, eps, table, (1.0 + scale_a).contiguous(), shift_a.contiguous())
++    fused_2 = kernels.gate_norm_mod_(fused_x, other_a, gate_a.contiguous(), weight, eps, table,
++                                     (1.0 + scale_m).contiguous(), shift_m.contiguous())
++    kernels.gate_(fused_x, other_m, gate_m.contiguous(), table)
++    return (stock_1, stock_2, stock_x), (fused_1, fused_2, fused_x)
++
++
++def self_check(model, width, eps, device) -> str | None:
++    """None when the kernels equal stock bit for bit at this width, else why not."""
++    import torch
++
++    try:
++        if _STATE.kernels is None:
++            from . import h3_block_fuse_triton
++
++            _STATE.kernels = h3_block_fuse_triton
++        generator = torch.Generator().manual_seed(width)
++        for rows in (1, 7, 64):
++            for scale in (1.0, 30.0, 0.02):
++                def tensor(shape, factor):
++                    return (torch.randn(shape, generator=generator) * factor).to(torch.bfloat16).to(device)
++
++                x = tensor((rows, width), scale)
++                others = tensor((rows, width), scale), tensor((rows, width), scale)
++                weight = (1 + tensor((width,), 0.3).to(torch.float32)).to(torch.bfloat16)
++                vectors = [tensor((12, width), 0.3) for _ in range(6)]
++                cut = rows // 2
++                by_token = torch.randint(0, 12, (rows - cut,), generator=generator).to(device)
++                segments = [(0, cut, 3), (cut, rows, by_token)] if cut else [(0, rows, by_token)]
++                table = torch.empty(rows, dtype=torch.int32, device=device)
++                for start, stop, row in segments:
++                    table[start:stop] = row.to(dtype=torch.int32) if torch.is_tensor(row) else row
++                stock, fused = _both_blocks(model, _STATE.kernels, x, weight, eps, segments, table, others, vectors)
++                for a, b in zip(stock, fused, strict=True):
++                    if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
++                        return f"kernels differ from stock at width {width}, {rows} rows"
++    except Exception as exc:  # noqa: BLE001
++        return f"kernels unavailable ({exc!r:.200})"
++    return None
++
++
++def _approved(model, width, eps, device) -> bool:
++    key = (width, eps, str(device))
++    if key not in _STATE.checked:
++        reason = self_check(model, width, eps, device)
++        _STATE.checked[key] = reason is None
++        if reason:
++            log.warning("H3 block fusion: stock path for this process, %s", reason)
++        else:
++            log.info("H3 block fusion: active (bit-identical to stock at width %d)", width)
++    return _STATE.checked[key]
++
++
++class _Plain:
++    def __init__(self, weight):
++        self.weight = weight
++
++    def __enter__(self):
++        return self.weight, None
++
++    def __exit__(self, *args):
++        return False
++
++
++def _weight(norm, x):
++    """The weight as comfy.ops' RMSNorm.forward would get it, in a context."""
++    if norm.comfy_cast_weights or len(norm.weight_function) > 0 or len(norm.bias_function) > 0:
++        return norm.cast_weight(x)
++    return _Plain(norm.weight)
++
++
++def install() -> bool:
++    """Wrap DiTBlock.forward once. Never raises; False leaves stock in place."""
++    if _STATE.installed:
++        return True
++    try:
++        import comfy.ldm.minimax.model as model
++        import comfy.ops
++        import torch
++    except Exception as exc:  # noqa: BLE001
++        log.warning("H3 block fusion: not installed (%r)", exc)
++        return False
++    original = model.DiTBlock.forward
++    bf16 = torch.bfloat16
++    tick = getattr(comfy.ops, "run_every_op", None)
++
++    @functools.wraps(original)
++    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):  # noqa: B006
++        def stock(reason=None):
++            if reason:
++                _note(reason)
++            return original(self, x, t_emb, mod_segments, rope_freqs,
++                            transformer_options=transformer_options, attention=attention)
++
++        if not enabled():
++            return stock()
++        n1, n2 = self.norm1, self.norm2
++        if not (x.dim() == 2 and x.is_cuda and x.dtype == bf16 and x.is_contiguous()
++                and x.data_ptr() % 16 == 0 and x.shape[1] % 4 == 0
++                and n1.eps is not None and n2.eps is not None and n1.eps == n2.eps
++                and tuple(n1.normalized_shape) == (x.shape[1],)
++                and tuple(n2.normalized_shape) == (x.shape[1],)
++                and not torch.is_grad_enabled()):
++            return stock(f"x {tuple(x.shape)} {x.dtype}")
++        if not _approved(model, x.shape[1], float(n1.eps), x.device):
++            return stock()
++        table = _row_index(mod_segments, x.shape[0], x.device)
++        if table is None:
++            return stock("modulation segments do not cover the rows")
++        kernels = _STATE.kernels
++        attention_fn = self.attn if attention is None else attention
++        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaln_proj(t_emb)
++        scale_a1, shift_a_f = (1.0 + scale_a.to(bf16)).contiguous(), shift_a.to(bf16).contiguous()
++        if tick is not None:
++            tick()
++        with _weight(n1, x) as (w1, _):
++            if w1 is None or w1.dtype != bf16 or not w1.is_contiguous():
++                return stock("norm weight not plain bf16")
++            h = kernels.norm_mod(x, w1, float(n1.eps), table, scale_a1, shift_a_f)
++        o = attention_fn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
++        del h
++        if not o.is_contiguous():
++            o = o.contiguous()
++        if tick is not None:
++            tick()
++        with _weight(n2, x) as (w2, _):
++            if w2 is None or w2.dtype != bf16 or not w2.is_contiguous():
++                # x is untouched so far: finish this block the stock way.
++                _note("second norm weight not plain bf16")
++                model._mod_gate(x, gate_a, o, mod_segments)
++                h = model._mod_scale_shift(n2(x), shift_m, scale_m, mod_segments)
++            else:
++                h = kernels.gate_norm_mod_(x, o, gate_a.to(bf16).contiguous(), w2, float(n2.eps), table,
++                                           (1.0 + scale_m.to(bf16)).contiguous(), shift_m.to(bf16).contiguous())
++        del o
++        o = self.mlp(h)
++        del h
++        if not o.is_contiguous():
++            o = o.contiguous()
++        kernels.gate_(x, o, gate_m.to(bf16).contiguous(), table)
++        _STATE.fused += 1
++        return x
++
++    forward._h3_block_fuse = True
++    model.DiTBlock.forward = forward
++    _STATE.installed = True
++    return True
+diff --git a/src/dgx_monarch/kernels/h3_block_fuse_triton.py b/src/dgx_monarch/kernels/h3_block_fuse_triton.py
+new file mode 100644
+index 0000000..4034346
+--- /dev/null
++++ b/src/dgx_monarch/kernels/h3_block_fuse_triton.py
+@@ -0,0 +1,194 @@
++# MIT License
++#
++# Copyright (c) 2026 Yuichi Suzuki
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++#
++# SPDX-License-Identifier: MIT
++"""Triton kernels fusing the small operations of MiniMax H3's DiTBlock.
++
++Vendored under the MIT license above from minimax-h3-multi-dgx-spark,
++comfyui_nodes/h3-fuse-graph/h3_fuse_kernels.py; comments translated, and the
++Python-header search removed because the image ships the headers.
++
++Stock DiTBlock.forward runs one RMSNorm kernel, then per segment a multiply and
++an add, and per segment one addcmul. Fused:
++  norm_mod        h = (rmsnorm(x) * s1[row]) + shift[row]
++  gate_norm_mod_  x = x + o * g[row], and h as above from that x
++  gate_           x = x + o * g[row]
++Rounding to bf16 happens at the same points as stock (the norm's output, after
++the multiply, after the add, after the residual), and the RMSNorm sum of squares
++adds in the same order as PyTorch's vectorized_layer_norm_kernel. h3_block_fuse
++checks that bit for bit in each process before using them.
++"""
++import torch
++import triton
++import triton.language as tl
++
++NUMX = 128   # PyTorch num_threads() (32 warps x 4)
++VEC = 4      # vec_size of PyTorch's vectorized_layer_norm_kernel
++
++
++@triton.jit
++def _cols4(t):
++    t = tl.reshape(t, [t.shape[0], 2, 2])
++    e, o = tl.split(t)
++    c0, c2 = tl.split(e)
++    c1, c3 = tl.split(o)
++    return c0, c1, c2, c3
++
++
++@triton.jit
++def _sumsq4(acc, t):
++    c0, c1, c2, c3 = _cols4(t)
++    acc = acc + c0 * c0
++    acc = acc + c1 * c1
++    acc = acc + c2 * c2
++    acc = acc + c3 * c3
++    return acc
++
++
++@triton.jit
++def _tree128(acc):
++    s = tl.reshape(acc, [4, 32])
++    s = tl.sum(tl.reshape(s, [4, 2, 16]), axis=1)
++    s = tl.sum(tl.reshape(s, [4, 2, 8]), axis=1)
++    s = tl.sum(tl.reshape(s, [4, 2, 4]), axis=1)
++    s = tl.sum(tl.reshape(s, [4, 2, 2]), axis=1)
++    s = tl.sum(tl.reshape(s, [4, 2, 1]), axis=1)
++    s = tl.reshape(s, [4])
++    s = tl.sum(tl.reshape(s, [2, 2]), axis=0)   # warp y and y+2
++    return tl.sum(s, axis=0)                    # warps 0 and 1
++
++
++@triton.jit
++def _rbf16(v):
++    # f32 -> bf16 round-to-nearest-even, returned as f32. Written as integer math because
++    # .to(bf16).to(f32) is folded away by Triton, which then fuses the next mul/add into an FMA.
++    u = v.to(tl.uint32, bitcast=True)
++    u = u + 0x7FFF + ((u >> 16) & 1)
++    u = (u >> 16) << 16
++    return u.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _norm_mod_kernel(X, W, RIDX, S1, SH, H, N, eps, ITERS: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    r = tl.load(RIDX + row).to(tl.int64)
++    xb = X + row * N
++    hb = H + row * N
++    s1b = S1 + r * N
++    shb = SH + r * N
++    t = tl.arange(0, 128)
++    v = tl.arange(0, 4)
++    acc = tl.zeros([128], tl.float32)
++    for it in tl.static_range(ITERS):
++        idx = (it * 128 + t)[:, None] * 4 + v[None, :]
++        x = tl.load(xb + idx, mask=idx < N, other=0.0).to(tl.float32)
++        acc = _sumsq4(acc, x)
++    tot = _tree128(acc)
++    rstd = tl.math.rsqrt(tl.math.div_rn(tot, N.to(tl.float32)) + eps)
++    for it in tl.static_range(ITERS):
++        idx = (it * 128 + t)[:, None] * 4 + v[None, :]
++        m = idx < N
++        x = tl.load(xb + idx, mask=m, other=0.0).to(tl.float32)
++        w = tl.load(W + idx, mask=m, other=0.0).to(tl.float32)
++        y = _rbf16(w * (rstd * x))
++        s1 = tl.load(s1b + idx, mask=m, other=0.0).to(tl.float32)
++        sh = tl.load(shb + idx, mask=m, other=0.0).to(tl.float32)
++        y = _rbf16(y * s1)
++        tl.store(hb + idx, (y + sh).to(tl.bfloat16), mask=m)
++
++
++@triton.jit
++def _gate_norm_mod_kernel(X, O, G, W, RIDX, S1, SH, H, N, eps, ITERS: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    r = tl.load(RIDX + row).to(tl.int64)
++    xb = X + row * N
++    ob = O + row * N
++    hb = H + row * N
++    gb = G + r * N
++    s1b = S1 + r * N
++    shb = SH + r * N
++    t = tl.arange(0, 128)
++    v = tl.arange(0, 4)
++    acc = tl.zeros([128], tl.float32)
++    # First pass: only the sum of squares of the updated x (x is not written yet).
++    for it in tl.static_range(ITERS):
++        idx = (it * 128 + t)[:, None] * 4 + v[None, :]
++        m = idx < N
++        x = tl.load(xb + idx, mask=m, other=0.0).to(tl.float32)
++        o = tl.load(ob + idx, mask=m, other=0.0).to(tl.float32)
++        g = tl.load(gb + idx, mask=m, other=0.0).to(tl.float32)
++        xn = _rbf16(x + o * g)
++        acc = _sumsq4(acc, xn)
++    tot = _tree128(acc)
++    rstd = tl.math.rsqrt(tl.math.div_rn(tot, N.to(tl.float32)) + eps)
++    # Second pass: recompute the same values and write x and h.
++    for it in tl.static_range(ITERS):
++        idx = (it * 128 + t)[:, None] * 4 + v[None, :]
++        m = idx < N
++        x = tl.load(xb + idx, mask=m, other=0.0).to(tl.float32)
++        o = tl.load(ob + idx, mask=m, other=0.0).to(tl.float32)
++        g = tl.load(gb + idx, mask=m, other=0.0).to(tl.float32)
++        xn = _rbf16(x + o * g)
++        tl.store(xb + idx, xn.to(tl.bfloat16), mask=m)
++        w = tl.load(W + idx, mask=m, other=0.0).to(tl.float32)
++        y = _rbf16(w * (rstd * xn))
++        s1 = tl.load(s1b + idx, mask=m, other=0.0).to(tl.float32)
++        sh = tl.load(shb + idx, mask=m, other=0.0).to(tl.float32)
++        y = _rbf16(y * s1)
++        tl.store(hb + idx, (y + sh).to(tl.bfloat16), mask=m)
++
++
++@triton.jit
++def _gate_kernel(X, O, G, RIDX, N, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = col < N
++    r = tl.load(RIDX + row).to(tl.int64)
++    x = tl.load(X + row * N + col, mask=m, other=0.0).to(tl.float32)
++    o = tl.load(O + row * N + col, mask=m, other=0.0).to(tl.float32)
++    g = tl.load(G + r * N + col, mask=m, other=0.0).to(tl.float32)
++    tl.store(X + row * N + col, (x + o * g).to(tl.bfloat16), mask=m)
++
++
++def _iters(n):
++    return triton.cdiv(triton.cdiv(n, VEC), NUMX)
++
++
++def norm_mod(x, w, eps, ridx, s1, sh):
++    s, n = x.shape
++    h = torch.empty_like(x)
++    _norm_mod_kernel[(s,)](x, w, ridx, s1, sh, h, n, eps, ITERS=_iters(n), num_warps=4)
++    return h
++
++
++def gate_norm_mod_(x, o, g, w, eps, ridx, s1, sh):
++    s, n = x.shape
++    h = torch.empty_like(x)
++    _gate_norm_mod_kernel[(s,)](x, o, g, w, ridx, s1, sh, h, n, eps, ITERS=_iters(n), num_warps=4)
++    return h
++
++
++def gate_(x, o, g, ridx):
++    s, n = x.shape
++    block = 1024
++    _gate_kernel[(s, triton.cdiv(n, block))](x, o, g, ridx, n, BLOCK=block, num_warps=4)
++    return x
+diff --git a/tests/test_h3_block_fuse.py b/tests/test_h3_block_fuse.py
+new file mode 100644
+index 0000000..c97cfe4
+--- /dev/null
++++ b/tests/test_h3_block_fuse.py
+@@ -0,0 +1,40 @@
++"""H3 DiTBlock fusion: the off switch and the row table. Bit equality
++with stock is checked by self_check in each process, on the GPU."""
++import pytest
++import torch
++
++from dgx_monarch.kernels import h3_block_fuse as fuse
++
++
++@pytest.fixture(autouse=True)
++def reset():
++    fuse._STATE.ridx_key = fuse._STATE.ridx = None
++
++
++def test_on_unless_switched_off(monkeypatch):
++    monkeypatch.delenv(fuse.ENV, raising=False)
++    assert fuse.enabled()
++    monkeypatch.setenv(fuse.ENV, "off")
++    assert not fuse.enabled()
++
++
++def test_row_table_mixes_runs_and_per_token_rows():
++    segments = [(2, 4, torch.tensor([5, 6])), (0, 2, 1)]
++    assert fuse._row_index(segments, 4, "cpu").tolist() == [1, 1, 5, 6]
++
++
++@pytest.mark.parametrize("segments", [
++    [(0, 2, 1)],
++    [(1, 4, 1)],
++    [(0, 2, 1), (3, 4, 1)],
++    [(0, 4, torch.tensor([1, 2]))],
++])
++def test_row_table_refuses_gaps_and_short_rows(segments):
++    assert fuse._row_index(segments, 4, "cpu") is None
++
++
++def test_row_table_is_reused_only_for_the_same_list():
++    segments = [(0, 4, 1)]
++    first = fuse._row_index(segments, 4, "cpu")
++    assert fuse._row_index(segments, 4, "cpu") is first
++    assert fuse._row_index([(0, 4, 1)], 4, "cpu") is not first
